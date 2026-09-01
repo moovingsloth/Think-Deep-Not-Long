@@ -33,16 +33,30 @@ def main(
     
     print(f"Using model: {model_name}")
     print(f"Generating for: {prompt}")
+    late = engine.late_regime_start
+    print(
+        f"DTR is the running share of tokens that settle at layer>={late}/{engine.L}; "
+        "it converges. c_t is the per-token settling layer."
+    )
     pieces = []
-    for word, is_deep, dtr in engine.generate_with_dtr(
+    n_deep = 0
+    n = 0
+    for word, is_deep, dtr, c_t in engine.generate_with_dtr(
         prompt, max_tokens=max_tokens, do_sample=do_sample
     ):
         pieces.append(word)
+        n += 1
+        n_deep += int(is_deep)
         marker = "🧠" if is_deep else "  "
         shown = word.replace("\n", "\\n").replace("\t", "\\t")
-        print(f"{marker} {shown!r:52} | DTR: {dtr:.2f}")
+        print(f"{marker} {shown!r:40} c_t={c_t:>2}/{engine.L} | DTR: {dtr:.2f}")
     print("\n--- decoded ---")
     print("".join(pieces))
+    if n:
+        print(
+            f"\nDeep tokens: {n_deep}/{n}  DTR={n_deep / n:.2f}  "
+            f"(late regime: layer>={late}/{engine.L})"
+        )
 
 
 if __name__ == "__main__":

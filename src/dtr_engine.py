@@ -1,6 +1,9 @@
+import math
 import torch
 import os
 import torch.nn.functional as F
+
+_LN2 = math.log(2.0)
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers import (
     LogitsProcessorList,
@@ -62,6 +65,11 @@ class DTREngine:
         self.g = g
         self.rho = rho
         self.L = self.model.config.num_hidden_layers # Total layers (L) [cite: 103]
+        self.late_regime_start = int(self.rho * self.L)
+        print(
+            f"  DTR: g={self.g} rho={self.rho} L={self.L} "
+            f"late regime = layers >= {self.late_regime_start}/{self.L}"
+        )
         self.eos_token_ids = self._collect_eos_ids()
         self._init_sampling_params(
             repetition_penalty=repetition_penalty,
@@ -254,8 +262,12 @@ class DTREngine:
         sequences = out.sequences if hasattr(out, "sequences") else out
         return sequences[:, input_ids.shape[1]:]
 
-    def _is_deep_at(self, hidden_states, pos: int) -> bool:
-        """Logit-lens settling test at a sequence position (Algorithm 1)."""
+    def _is_deep_at(self, hidden_states, pos: int) -> tuple[bool, int]:
+        """Logit-lens settling test at a sequence position (Algorithm 1).
+
+        Returns (is_deep, c_t) where c_t is the first layer whose JSD with the
+        final layer is <= g.
+        """
         h_final = self.model.model.norm(hidden_states[-1][:, pos, :])
         p_L = F.softmax(self.model.lm_head(h_final).to(torch.float32), dim=-1)
         c_t = self.L
@@ -265,10 +277,10 @@ class DTREngine:
             if self.calculate_jsd(p_L, p_l).item() <= self.g:
                 c_t = l
                 break
-        return c_t >= int(self.rho * self.L)
+        return c_t >= self.late_regime_start, c_t
 
-    def _deep_flags(self, prompt_ids: torch.Tensor, generated_ids: torch.Tensor) -> list[bool]:
-        """DTR flags for each generated token from one causal forward."""
+    def _deep_flags(self, prompt_ids: torch.Tensor, generated_ids: torch.Tensor) -> list[tuple[bool, int]]:
+        """(is_deep, c_t) for each generated token from one causal forward."""
         if generated_ids.numel() == 0:
             return []
         full = torch.cat([prompt_ids, generated_ids], dim=1)
@@ -283,20 +295,18 @@ class DTREngine:
         return flags
 
     def calculate_jsd(self, p, q):
-        """Eq 2: Jensen-Shannon Divergence [cite: 145]"""
-        g = 0.5 # Default settling threshold - counts tokens that truly required sustained internal revision
-        # if you set g too low (e.g., 0.25), the metric becomes "overly permissive". 
-        # It starts counting simple, low-effort tokens as "thinking," 
-        # which causes the correlation with accuracy to flatten out or disappear
-        m = g * (p + q)
+        """Eq 2: Jensen-Shannon Divergence in bits, bounded in [0, 1].
 
-        # p_log = p.clamp(min=1e-10).log()
-        # q_log = q.clamp(min=1e-10).log()
-        m_log = m.clamp(min=1e-10).log()
-
-        # Using kl_div for numerical stability on MPS
-        return 0.5 * (F.kl_div(m_log, p, reduction='batchmean', log_target=False) + 
-                      F.kl_div(m_log, q, reduction='batchmean', log_target=False))
+        The paper's settling threshold g=0.5 is defined on bit-JSD (Figure 3
+        reports values > ln(2), so they are not nats). PyTorch kl_div is nats.
+        """
+        p = p.to(torch.float32)
+        q = q.to(torch.float32)
+        m = 0.5 * (p + q)
+        log_m = m.clamp(min=1e-10).log()
+        # Sum over vocab (last dim) so 1D and 2D [batch, vocab] both work.
+        kl = lambda dist: F.kl_div(log_m, dist, reduction="none", log_target=False).sum(dim=-1).mean()
+        return 0.5 * (kl(p) + kl(q)) / _LN2
 
     """
         h_final: normalized final hidden state.
@@ -315,7 +325,7 @@ class DTREngine:
             outputs = self.model(token_ids, output_hidden_states=True)
             
         hidden_states = outputs.hidden_states  # Tuple of (embedding, layer1, ..., layerL)
-        is_deep = self._is_deep_at(hidden_states, -1)
+        is_deep, _c_t = self._is_deep_at(hidden_states, -1)
         
         # Decode from the model's actual next-token logits; DTR still uses the logit lens
         if getattr(outputs, "logits", None) is not None:
@@ -346,7 +356,9 @@ class DTREngine:
             do_sample: If None, use the model's generation_config
             
         Yields:
-            Tuple of (token_str, is_deep, dtr) for each generated token
+            Tuple of (token_str, is_deep, dtr, c_t) for each generated token.
+            dtr is the running share of deep tokens (converges to the mean);
+            c_t is the per-token settling layer.
         """
         if do_sample is None:
             do_sample = getattr(self, "do_sample_default", True)
@@ -354,11 +366,11 @@ class DTREngine:
         generated_ids = self._generate_ids(prompt_ids, max_tokens, do_sample)
         flags = self._deep_flags(prompt_ids, generated_ids)
         deep_tokens = 0
-        for t, (token_id, is_deep) in enumerate(zip(generated_ids[0].tolist(), flags), start=1):
+        for t, (token_id, (is_deep, c_t)) in enumerate(zip(generated_ids[0].tolist(), flags), start=1):
             if is_deep:
                 deep_tokens += 1
             dtr = deep_tokens / t  # Eq 6: Deep-Thinking Ratio [cite: 164]
-            yield self.tokenizer.decode([token_id]), is_deep, dtr
+            yield self.tokenizer.decode([token_id]), is_deep, dtr, c_t
     
     def estimate_dtr_from_prefix(
         self,
@@ -382,7 +394,7 @@ class DTREngine:
         generated_tokens = generated_ids[0].tolist()
         flags = self._deep_flags(prompt_ids, generated_ids)
         tokens_generated = len(generated_tokens)
-        deep_tokens = sum(1 for flag in flags if flag)
+        deep_tokens = sum(1 for is_deep, _c_t in flags if is_deep)
         prefix_dtr = deep_tokens / tokens_generated if tokens_generated > 0 else 0.0
         generated_text = self.tokenizer.decode(generated_tokens)
         
@@ -424,6 +436,7 @@ class DTREngine:
             samples.append({
                 'text': prefix_text,
                 'dtr': prefix_dtr,
+                'prefix_dtr': prefix_dtr,
                 'tokens': tokens_gen,
                 'generated_ids': prefix_ids,
                 'full_generation': False,
@@ -440,7 +453,7 @@ class DTREngine:
                     do_sample=do_sample,
                 )
                 sample['text'] = full_text
-                sample['dtr'] = final_dtr
+                sample['continuation_dtr'] = final_dtr
                 sample['tokens'] = total_tokens
                 sample['full_generation'] = True
         else:
@@ -458,7 +471,7 @@ class DTREngine:
                         do_sample=do_sample,
                     )
                     sample['text'] = full_text
-                    sample['dtr'] = final_dtr
+                    sample['continuation_dtr'] = final_dtr
                     sample['tokens'] = total_tokens
                     sample['full_generation'] = True
                 else:
@@ -504,7 +517,7 @@ class DTREngine:
         generated_tokens = continuation_ids[0].tolist()
         flags = self._deep_flags(context_ids, continuation_ids)
         tokens_generated = len(generated_tokens)
-        deep_tokens = sum(1 for flag in flags if flag)
+        deep_tokens = sum(1 for is_deep, _c_t in flags if is_deep)
         continuation_dtr = deep_tokens / tokens_generated if tokens_generated > 0 else 0.0
         continuation_text = self.tokenizer.decode(generated_tokens)
         full_text = prefix_text + continuation_text
@@ -558,13 +571,13 @@ class DTREngine:
         )
         print(f"Using model: {engine.model_id}, cache: {engine.cache_dir}")
         print(f"Generating for: {args.prompt}")
-        for word, is_deep, dtr in engine.generate_with_dtr(
+        for word, is_deep, dtr, c_t in engine.generate_with_dtr(
             args.prompt,
             max_tokens=args.max_tokens,
             do_sample=False if args.greedy else None,
         ):
             marker = "<<deep-think-token>>" if is_deep else "  "
-            print(f"{marker} '{word:10}' | DTR: {dtr:.2f}")
+            print(f"{marker} '{word:10}' c_t={c_t:>2}/{engine.L} | DTR: {dtr:.2f}")
 
 
     if __name__ == "__main__":

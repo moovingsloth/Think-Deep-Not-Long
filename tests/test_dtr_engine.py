@@ -90,6 +90,15 @@ class TestDTREngineUnit(unittest.TestCase):
         jsd = self.mock_engine.calculate_jsd(p, q)
         self.assertGreaterEqual(jsd.item(), 0.0)
         self.assertTrue(torch.isfinite(jsd), "JSD should be finite even with zeros")
+
+    def test_jsd_onehot_is_one_in_bits(self):
+        """Distinct one-hots have JSD = 1 bit (paper units, not nats)."""
+        p = torch.zeros(8)
+        p[0] = 1.0
+        q = torch.zeros(8)
+        q[1] = 1.0
+        jsd = self.mock_engine.calculate_jsd(p, q)
+        self.assertAlmostEqual(jsd.item(), 1.0, places=5)
     
     # ========================================================================
     # Test late regime calculation
@@ -434,7 +443,7 @@ class TestDTREngineIntegration(unittest.TestCase):
         tokens_generated = 0
         last_dtr = 0
         
-        for word, is_deep, dtr in gen:
+        for word, is_deep, dtr, *_ in gen:
             tokens_generated += 1
             last_dtr = dtr
             self.assertGreaterEqual(dtr, 0.0, f"DTR should be >= 0 (got {dtr})")
@@ -461,7 +470,7 @@ class TestDTREngineIntegration(unittest.TestCase):
         shallow_count = 0
         results = []
         
-        for word, is_deep, dtr in gen:
+        for word, is_deep, dtr, *_ in gen:
             results.append((word, is_deep))
             if is_deep:
                 deep_count += 1
@@ -494,7 +503,7 @@ class TestDTREngineIntegration(unittest.TestCase):
         tokens = list(gen)
         
         self.assertEqual(len(tokens), 1, "Should generate exactly 1 token")
-        word, is_deep, dtr = tokens[0]
+        word, is_deep, dtr, *_ = tokens[0]
         self.assertIsInstance(word, str)
         self.assertIsInstance(is_deep, bool)
         # DTR for single token is either 0.0 or 1.0
