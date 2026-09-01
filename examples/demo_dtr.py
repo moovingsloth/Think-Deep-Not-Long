@@ -8,18 +8,41 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from src.dtr_engine import DTREngine
 from src.config.models import MODELS
 
-def main(model_name: str = "qwen", prompt: str = "Calculate 12 * 12: ", max_tokens: int = 25):
+def main(
+    model_name: str = "qwen.6b",
+    prompt: str = "Calculate 12 * 12: ",
+    max_tokens: int = 25,
+    do_sample: bool | None = None,
+    repetition_penalty: float | None = None,
+    no_repeat_ngram_size: int | None = None,
+    seed: int | None = None,
+):
     if model_name not in MODELS:
         raise ValueError(f"Unknown model '{model_name}'. Available: {list(MODELS.keys())}")
+
+    if seed is not None:
+        import torch
+        torch.manual_seed(seed)
     
-    config = MODELS[args.model]
-    engine = DTREngine(**config)
+    config = MODELS[model_name]
+    engine = DTREngine(
+        **config,
+        repetition_penalty=repetition_penalty,
+        no_repeat_ngram_size=no_repeat_ngram_size,
+    )
     
-    print(f"Using model: {args.model}")
+    print(f"Using model: {model_name}")
     print(f"Generating for: {prompt}")
-    for word, is_deep, dtr in engine.generate_with_dtr(prompt, max_tokens=max_tokens):
+    pieces = []
+    for word, is_deep, dtr in engine.generate_with_dtr(
+        prompt, max_tokens=max_tokens, do_sample=do_sample
+    ):
+        pieces.append(word)
         marker = "🧠" if is_deep else "  "
-        print(f"{marker} '{word:50}' | DTR: {dtr:.2f}")
+        shown = word.replace("\n", "\\n").replace("\t", "\\t")
+        print(f"{marker} {shown!r:52} | DTR: {dtr:.2f}")
+    print("\n--- decoded ---")
+    print("".join(pieces))
 
 
 if __name__ == "__main__":
@@ -27,7 +50,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--model", 
-        default="qwen", 
+        default="qwen.6b", 
         choices=list(MODELS.keys()), 
         help="Model to use (must be downloaded first)")
     prompt = "Calculate 12 * 12: "
@@ -35,6 +58,32 @@ if __name__ == "__main__":
 
     parser.add_argument("--prompt", default=prompt)
     parser.add_argument("--max-tokens", type=int, default=25)
+    parser.add_argument(
+        "--greedy",
+        action="store_true",
+        help="Force greedy decoding (thinking models often loop without sampling)",
+    )
+    parser.add_argument(
+        "--repetition-penalty",
+        type=float,
+        default=None,
+        help="Penalty >1.0 downweights already generated tokens (default 1.15)",
+    )
+    parser.add_argument(
+        "--no-repeat-ngram-size",
+        type=int,
+        default=None,
+        help="Ban repeating n-grams (default 6; 0 disables)",
+    )
+    parser.add_argument("--seed", type=int, default=None)
     args = parser.parse_args()
     
-    main(model_name=args.model, prompt=args.prompt, max_tokens=args.max_tokens)
+    main(
+        model_name=args.model,
+        prompt=args.prompt,
+        max_tokens=args.max_tokens,
+        do_sample=False if args.greedy else None,
+        repetition_penalty=args.repetition_penalty,
+        no_repeat_ngram_size=args.no_repeat_ngram_size,
+        seed=args.seed,
+    )

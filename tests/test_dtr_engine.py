@@ -3,6 +3,7 @@ import unittest
 from unittest.mock import Mock, MagicMock, patch
 import torch.nn.functional as F
 from src.dtr_engine import DTREngine
+from src.model.model_utils import get_model_dtype
 
 
 # ============================================================================
@@ -192,6 +193,89 @@ class TestDTREngineUnit(unittest.TestCase):
         for i, (actual, expected) in enumerate(zip(dtrs, expected_dtrs)):
             self.assertAlmostEqual(actual, expected, places=5,
                                  msg=f"DTR at step {i+1} should be {expected}")
+
+    # ========================================================================
+    # Test prompt encoding and token selection
+    # ========================================================================
+
+    def test_encode_prompt_uses_chat_template(self):
+        """Chat models should wrap the user prompt with the chat template."""
+        engine = Mock(spec=DTREngine)
+        engine.device = torch.device("cpu")
+        engine.tokenizer = Mock()
+        engine.tokenizer.chat_template = "dummy-template"
+        engine.tokenizer.apply_chat_template.return_value = torch.tensor([[11, 22, 33]])
+        engine._encode_prompt = DTREngine._encode_prompt.__get__(engine, DTREngine)
+
+        ids = engine._encode_prompt("Calculate 12 * 12")
+
+        engine.tokenizer.apply_chat_template.assert_called_once()
+        kwargs = engine.tokenizer.apply_chat_template.call_args.kwargs
+        self.assertTrue(kwargs["add_generation_prompt"])
+        self.assertTrue(kwargs["enable_thinking"])
+        self.assertEqual(kwargs["return_tensors"], "pt")
+        messages = engine.tokenizer.apply_chat_template.call_args.args[0]
+        self.assertEqual(messages[0]["role"], "user")
+        self.assertEqual(messages[0]["content"], "Calculate 12 * 12")
+        self.assertEqual(ids.shape, (1, 3))
+        engine.tokenizer.encode.assert_not_called()
+
+    def test_encode_prompt_falls_back_without_chat_template(self):
+        """Raw encode is used when the tokenizer has no chat template."""
+        engine = Mock(spec=DTREngine)
+        engine.device = torch.device("cpu")
+        engine.tokenizer = Mock()
+        engine.tokenizer.chat_template = None
+        engine.tokenizer.encode.return_value = torch.tensor([[7, 8]])
+        engine._encode_prompt = DTREngine._encode_prompt.__get__(engine, DTREngine)
+
+        ids = engine._encode_prompt("hello")
+
+        engine.tokenizer.encode.assert_called_once_with("hello", return_tensors="pt")
+        engine.tokenizer.apply_chat_template.assert_not_called()
+        self.assertEqual(ids.tolist(), [[7, 8]])
+
+    def test_select_next_token_greedy_is_argmax(self):
+        """Greedy decoding must pick the max-logit token."""
+        engine = Mock(spec=DTREngine)
+        engine._select_next_token = DTREngine._select_next_token.__get__(engine, DTREngine)
+        logits = torch.tensor([[0.1, 3.0, 0.2]])
+        token = engine._select_next_token(logits, do_sample=False)
+        self.assertEqual(token.item(), 1)
+        self.assertEqual(token.shape, (1, 1))
+
+    def test_no_repeat_ngram_blocks_loop(self):
+        """Repeating a 3-gram must be banned even under greedy decoding."""
+        engine = Mock(spec=DTREngine)
+        engine.repetition_penalty = 1.0
+        engine.no_repeat_ngram_size = 3
+        engine.temperature = 1.0
+        engine.top_k = 0
+        engine.top_p = 1.0
+        engine._select_next_token = DTREngine._select_next_token.__get__(engine, DTREngine)
+        # 0,1,2 already occurred; 0,1 again would complete the same trigram with 2
+        input_ids = torch.tensor([[0, 1, 2, 0, 1]])
+        logits = torch.tensor([[0.0, 0.0, 10.0, 1.0]])
+        token = engine._select_next_token(
+            logits, do_sample=False, input_ids=input_ids, prompt_len=0
+        )
+        self.assertEqual(token.item(), 3)
+
+    def test_collect_eos_ids_merges_tokenizer_and_generation_config(self):
+        """Qwen exposes two EOS ids (im_end and endoftext)."""
+        engine = Mock(spec=DTREngine)
+        engine.tokenizer = Mock()
+        engine.tokenizer.eos_token_id = 151645
+        engine.model = Mock()
+        engine.model.generation_config = Mock()
+        engine.model.generation_config.eos_token_id = [151645, 151643]
+        engine._collect_eos_ids = DTREngine._collect_eos_ids.__get__(engine, DTREngine)
+
+        self.assertEqual(engine._collect_eos_ids(), {151645, 151643})
+
+    def test_cpu_load_dtype_is_float16(self):
+        """CPU/MPS path stays on float16 for memory."""
+        self.assertEqual(get_model_dtype(torch.device("cpu")), torch.float16)
 
 
 # ============================================================================
