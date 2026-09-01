@@ -11,6 +11,7 @@ _project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(
 sys.path.insert(0, _project_root)
 
 from src.config.models import MODELS
+from src.model.model_utils import get_model_dtype
 
 load_dotenv()  # Load .env from project root
 HF_TOKEN = os.getenv("HF_TOKEN")
@@ -45,7 +46,7 @@ def main():
 
     model = AutoModelForCausalLM.from_pretrained(
         model_id,
-        dtype=torch.float16,
+        dtype=get_model_dtype(torch.device("cuda" if torch.cuda.is_available() else "cpu")),
         cache_dir=cache_dir,
         low_cpu_mem_usage=True,
         token=HF_TOKEN

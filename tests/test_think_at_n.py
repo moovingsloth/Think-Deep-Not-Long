@@ -65,6 +65,19 @@ class TestAnswerExtraction(unittest.TestCase):
         
         text = ""
         self.assertIsNone(extract_answer(text))
+
+    def test_extract_prefers_post_think_span(self):
+        """Thinking traces contain decoy numbers; the answer is after </think>."""
+        text = "<think>12 times 12 might be 12 or 13</think>\n\\boxed{144}"
+        self.assertEqual(extract_answer(text), "144")
+
+        text = "<think>the answer is 12</think>\nThe answer is 144"
+        self.assertEqual(extract_answer(text), "144")
+
+    def test_extract_falls_back_if_think_unfinished(self):
+        """If </think> never appears, use the full trace."""
+        text = "<think>Therefore \\boxed{42}"
+        self.assertEqual(extract_answer(text), "42")
     
     def test_normalize_answer(self):
         """Test answer normalization."""

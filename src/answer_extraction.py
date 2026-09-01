@@ -9,14 +9,39 @@ import re
 from typing import Optional
 
 
+def _extract_answer_from_span(text: str) -> Optional[str]:
+    """Extract a numeric answer from a text span (boxed, then patterns, then last number)."""
+    boxed_match = re.search(r'\\boxed\{([^}]+)\}', text)
+    if boxed_match:
+        answer = boxed_match.group(1).strip()
+        answer = answer.replace('$', '').replace('\\', '').strip()
+        return answer
+
+    answer_patterns = [
+        r'(?:the\s+)?answer\s+is\s+([+-]?\d+\.?\d*)',
+        r'(?:final\s+)?answer:\s*([+-]?\d+\.?\d*)',
+        r'equals?\s+([+-]?\d+\.?\d*)',
+    ]
+    for pattern in answer_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            return match.group(1).strip()
+
+    numbers = re.findall(r'[+-]?\d+\.?\d*', text)
+    if numbers:
+        return numbers[-1]
+    return None
+
+
 def extract_answer(text: str) -> Optional[str]:
     """
     Extract answer from generated text.
     
     Tries multiple strategies in order:
-    1. LaTeX \boxed{...} notation (AIME style)
-    2. "answer is X" patterns
-    3. Last numerical value in text
+    1. Post-</think> span (Qwen thinking models)
+    2. LaTeX \boxed{...} notation (AIME style)
+    3. "answer is X" patterns
+    4. Last numerical value in text
     
     Args:
         text: Generated text containing the answer
@@ -31,37 +56,21 @@ def extract_answer(text: str) -> Optional[str]:
         '12'
         >>> extract_answer("We get x = 8")
         '8'
+        >>> extract_answer("<think>12 then 13</think>\\\\n\\\\boxed{144}")
+        '144'
     """
     if not text:
         return None
-    
-    # Strategy 1: LaTeX \boxed{...}
-    boxed_match = re.search(r'\\boxed\{([^}]+)\}', text)
-    if boxed_match:
-        answer = boxed_match.group(1).strip()
-        # Clean up common LaTeX artifacts
-        answer = answer.replace('$', '').replace('\\', '').strip()
-        return answer
-    
-    # Strategy 2: "answer is X" patterns (case insensitive)
-    answer_patterns = [
-        r'(?:the\s+)?answer\s+is\s+([+-]?\d+\.?\d*)',
-        r'(?:final\s+)?answer:\s*([+-]?\d+\.?\d*)',
-        r'equals?\s+([+-]?\d+\.?\d*)',
-    ]
-    
-    for pattern in answer_patterns:
-        match = re.search(pattern, text, re.IGNORECASE)
-        if match:
-            return match.group(1).strip()
-    
-    # Strategy 3: Last numerical value (fallback)
-    # Match integers and decimals, including negative numbers
-    numbers = re.findall(r'[+-]?\d+\.?\d*', text)
-    if numbers:
-        return numbers[-1]
-    
-    return None
+
+    # Prefer the final answer after the thinking trace.
+    if "</think>" in text:
+        after = text.rsplit("</think>", 1)[-1].strip()
+        if after:
+            found = _extract_answer_from_span(after)
+            if found is not None:
+                return found
+
+    return _extract_answer_from_span(text)
 
 
 def normalize_answer(answer: Optional[str]) -> Optional[str]:

@@ -1,14 +1,17 @@
+import math
 import torch
 import torch.nn.functional as F
 
+_LN2 = math.log(2.0)
+
 def calculate_jsd(p_final, p_inter):
-    """Equation 2: Measuring the change in internal prediction[cite: 144, 145]."""
+    """Equation 2: JSD in bits (paper g=0.5 is on [0, 1])."""
+    p_final = p_final.to(torch.float32)
+    p_inter = p_inter.to(torch.float32)
     m = 0.5 * (p_final + p_inter)
-    # eps prevents log(0) errors
-    eps = 1e-10
-    term1 = F.kl_div(m.log(), p_final + eps, reduction='batchmean')
-    term2 = F.kl_div(m.log(), p_inter + eps, reduction='batchmean')
-    return 0.5 * (term1 + term2)
+    log_m = m.clamp(min=1e-10).log()
+    kl = lambda dist: F.kl_div(log_m, dist, reduction="none", log_target=False).sum(dim=-1).mean()
+    return 0.5 * (kl(p_final) + kl(p_inter)) / _LN2
 
 def get_settling_depth(all_hidden_states, lm_head, final_norm, threshold=0.5):
     """

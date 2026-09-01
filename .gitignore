@@ -32,3 +32,6 @@ temp_commands.sh
 synthesis/
 plans/
 docs/
+
+# Benchmark outputs
+results/

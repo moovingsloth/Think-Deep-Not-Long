@@ -1,6 +1,17 @@
 # from transformers import AutoModelForCausalLM, AutoTokenizer
 import torch
 
+def get_model_dtype(device):
+    """Pick a load dtype that matches the hardware.
+
+    Qwen3-4B-Thinking is trained in bfloat16. float16 on CUDA can overflow
+    and collapse generation into high-frequency loops (e.g. repeating 'the').
+    MPS/CPU keep float16 for memory.
+    """
+    if device.type == "cuda" and torch.cuda.is_bf16_supported():
+        return torch.bfloat16
+    return torch.float16
+
 def get_device(enable_tensor_cores=True):
     if torch.cuda.is_available():
         device = torch.device("cuda")
