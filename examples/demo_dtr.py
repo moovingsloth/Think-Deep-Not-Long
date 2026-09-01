@@ -67,13 +67,13 @@ if __name__ == "__main__":
         "--repetition-penalty",
         type=float,
         default=None,
-        help="Penalty >1.0 downweights already generated tokens (default 1.15)",
+        help="Penalty >1.0 downweights already generated tokens (default 1.0 = off)",
     )
     parser.add_argument(
         "--no-repeat-ngram-size",
         type=int,
         default=None,
-        help="Ban repeating n-grams (default 6; 0 disables)",
+        help="Ban repeating n-grams (default 0 = off; >0 can break arithmetic)",
     )
     parser.add_argument("--seed", type=int, default=None)
     args = parser.parse_args()

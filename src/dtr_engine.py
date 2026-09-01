@@ -102,11 +102,12 @@ class DTREngine:
         repetition_penalty: float | None = None,
         no_repeat_ngram_size: int | None = None,
     ):
-        """Read decoding hyperparameters from generation_config, with anti-loop defaults.
+        """Read decoding hyperparameters from the model's generation_config.
 
-        Qwen3-Thinking's generation_config uses sampling (T=0.6, top_p=0.95, top_k=20).
-        Greedy argmax on these models starts coherently then collapses into n-gram loops
-        such as "the more the total is the more the total is ...".
+        Use that config as-is. Extra repetition/n-gram penalties look like they
+        stop loops, but they downweight digit tokens ('1', '2') so 12*12 derails
+        into 11 / 3 / 5 instead of repeating 12. Qwen3-Thinking only sets
+        do_sample + temperature/top_p/top_k.
         """
         gc = getattr(self.model, "generation_config", None)
         diff = {}
@@ -123,10 +124,10 @@ class DTREngine:
         self.top_p = float(diff.get("top_p", 0.95) or 1.0)
         self.do_sample_default = bool(diff.get("do_sample", True))
         self.repetition_penalty = float(
-            repetition_penalty if repetition_penalty is not None else diff.get("repetition_penalty", 1.15)
+            repetition_penalty if repetition_penalty is not None else diff.get("repetition_penalty", 1.0)
         )
         self.no_repeat_ngram_size = int(
-            no_repeat_ngram_size if no_repeat_ngram_size is not None else diff.get("no_repeat_ngram_size", 6)
+            no_repeat_ngram_size if no_repeat_ngram_size is not None else diff.get("no_repeat_ngram_size", 0)
         )
         print(
             f"  decoding: do_sample={self.do_sample_default} T={self.temperature} "
@@ -222,6 +223,65 @@ class DTREngine:
         probs = F.softmax(logits, dim=-1)
         return torch.multinomial(probs, num_samples=1)
 
+    def _generate_ids(
+        self,
+        input_ids: torch.Tensor,
+        max_new_tokens: int,
+        do_sample: bool,
+    ) -> torch.Tensor:
+        """Decode with `model.generate()` so sampling matches the official path."""
+        kwargs = {
+            "input_ids": input_ids,
+            "attention_mask": torch.ones_like(input_ids),
+            "max_new_tokens": max_new_tokens,
+            "do_sample": do_sample,
+            "use_cache": True,
+            "pad_token_id": self.tokenizer.pad_token_id or self.tokenizer.eos_token_id,
+        }
+        if self.eos_token_ids:
+            kwargs["eos_token_id"] = sorted(self.eos_token_ids)
+        if do_sample:
+            kwargs["temperature"] = self.temperature
+            kwargs["top_p"] = self.top_p
+            if self.top_k:
+                kwargs["top_k"] = self.top_k
+        if self.repetition_penalty and self.repetition_penalty != 1.0:
+            kwargs["repetition_penalty"] = self.repetition_penalty
+        if self.no_repeat_ngram_size:
+            kwargs["no_repeat_ngram_size"] = int(self.no_repeat_ngram_size)
+        with torch.no_grad():
+            out = self.model.generate(**kwargs)
+        sequences = out.sequences if hasattr(out, "sequences") else out
+        return sequences[:, input_ids.shape[1]:]
+
+    def _is_deep_at(self, hidden_states, pos: int) -> bool:
+        """Logit-lens settling test at a sequence position (Algorithm 1)."""
+        h_final = self.model.model.norm(hidden_states[-1][:, pos, :])
+        p_L = F.softmax(self.model.lm_head(h_final).to(torch.float32), dim=-1)
+        c_t = self.L
+        for l in range(1, self.L + 1):
+            h_l = self.model.model.norm(hidden_states[l][:, pos, :])
+            p_l = F.softmax(self.model.lm_head(h_l).to(torch.float32), dim=-1)
+            if self.calculate_jsd(p_L, p_l).item() <= self.g:
+                c_t = l
+                break
+        return c_t >= int(self.rho * self.L)
+
+    def _deep_flags(self, prompt_ids: torch.Tensor, generated_ids: torch.Tensor) -> list[bool]:
+        """DTR flags for each generated token from one causal forward."""
+        if generated_ids.numel() == 0:
+            return []
+        full = torch.cat([prompt_ids, generated_ids], dim=1)
+        with torch.no_grad():
+            outputs = self.model(full, output_hidden_states=True)
+        hidden_states = outputs.hidden_states
+        prompt_len = prompt_ids.shape[1]
+        flags = []
+        for i in range(generated_ids.shape[1]):
+            pos = prompt_len + i - 1
+            flags.append(self._is_deep_at(hidden_states, pos))
+        return flags
+
     def calculate_jsd(self, p, q):
         """Eq 2: Jensen-Shannon Divergence [cite: 145]"""
         g = 0.5 # Default settling threshold - counts tokens that truly required sustained internal revision
@@ -255,35 +315,14 @@ class DTREngine:
             outputs = self.model(token_ids, output_hidden_states=True)
             
         hidden_states = outputs.hidden_states  # Tuple of (embedding, layer1, ..., layerL)
-        # Use hidden_states[-1] with same norm+lm_head pipeline as intermediate layers (Logit Lens consistency)
-        h_final = self.model.model.norm(hidden_states[-1][:, -1, :])
-        # Upcast to float32 for the numerically sensitive JSD math
-        lens_logits = self.model.lm_head(h_final).to(torch.float32)
-        p_L = F.softmax(lens_logits, dim=-1)  # Final layer distribution [cite: 108]
-        
-        # Algorithm 1: Find settling depth c_t [cite: 113, 155]
-        # hidden_states[0] = embedding, hidden_states[1..L] = after each transformer layer
-        c_t = self.L
-        # Iterating through the layers to find the settling depth
-        for l in range(1, self.L + 1):
-            # Project intermediate hidden state to vocabulary space (Logit Lens) [cite: 105, 106]
-            h_l = self.model.model.norm(hidden_states[l][:, -1, :])
-            p_l = F.softmax(self.model.lm_head(h_l).to(torch.float32), dim=-1)
-            
-            if self.calculate_jsd(p_L, p_l).item() <= self.g:
-                c_t = l
-                break
-        
-        # Check if token is "deep-thinking" (settles in the late regime) [cite: 157, 161]
-        late_regime_start = int(self.rho * self.L) 
-        # print(f"late_regime_start = {late_regime_start}")
-        is_deep = c_t >= late_regime_start # Late regime definition 
+        is_deep = self._is_deep_at(hidden_states, -1)
         
         # Decode from the model's actual next-token logits; DTR still uses the logit lens
         if getattr(outputs, "logits", None) is not None:
             dec_logits = outputs.logits[:, -1, :].to(torch.float32)
         else:
-            dec_logits = lens_logits
+            h_final = self.model.model.norm(hidden_states[-1][:, -1, :])
+            dec_logits = self.model.lm_head(h_final).to(torch.float32)
         next_token = self._select_next_token(
             dec_logits,
             do_sample=do_sample,
@@ -296,33 +335,30 @@ class DTREngine:
         """
         Generate tokens with DTR calculation (Algorithm 1).
         
+        Decoding uses `model.generate()` (same path as the official Qwen demo).
+        DTR is then scored with the logit lens on that sequence — causal hidden
+        states at the position that predicted each token, so values match
+        token-by-token probing.
+        
         Args:
             prompt: Input text prompt (user content; chat template is applied)
             max_tokens: Maximum tokens to generate
-            do_sample: If None, use the model's generation_config (Qwen thinking
-                models sample). Greedy decoding often loops after a coherent start.
+            do_sample: If None, use the model's generation_config
             
         Yields:
             Tuple of (token_str, is_deep, dtr) for each generated token
         """
         if do_sample is None:
             do_sample = getattr(self, "do_sample_default", True)
-        token_ids = self._encode_prompt(prompt)
-        prompt_len = token_ids.shape[1]
+        prompt_ids = self._encode_prompt(prompt)
+        generated_ids = self._generate_ids(prompt_ids, max_tokens, do_sample)
+        flags = self._deep_flags(prompt_ids, generated_ids)
         deep_tokens = 0
-        
-        for t in range(1, max_tokens + 1):
-            next_token, is_deep = self.generate_step(
-                token_ids, do_sample=do_sample, prompt_len=prompt_len
-            )
-            if is_deep: deep_tokens += 1
-            
-            token_ids = torch.cat([token_ids, next_token], dim=1)
-            dtr = deep_tokens / t # Eq 6: Deep-Thinking Ratio [cite: 164]
-            
-            yield self.tokenizer.decode(next_token[0]), is_deep, dtr
-            if next_token.item() in self.eos_token_ids:
-                break
+        for t, (token_id, is_deep) in enumerate(zip(generated_ids[0].tolist(), flags), start=1):
+            if is_deep:
+                deep_tokens += 1
+            dtr = deep_tokens / t  # Eq 6: Deep-Thinking Ratio [cite: 164]
+            yield self.tokenizer.decode([token_id]), is_deep, dtr
     
     def estimate_dtr_from_prefix(
         self,
@@ -341,25 +377,12 @@ class DTREngine:
         Returns:
             Tuple of (generated_text, prefix_dtr, tokens_generated, generated_ids)
         """
-        token_ids = self._encode_prompt(prompt)
-        prompt_len = token_ids.shape[1]
-        deep_tokens = 0
-        generated_tokens = []
-        
-        for t in range(1, prefix_length + 1):
-            next_token, is_deep = self.generate_step(
-                token_ids, do_sample=do_sample, prompt_len=prompt_len
-            )
-            if is_deep:
-                deep_tokens += 1
-            
-            generated_tokens.append(next_token.item())
-            token_ids = torch.cat([token_ids, next_token], dim=1)
-            
-            if next_token.item() in self.eos_token_ids:
-                break
-        
+        prompt_ids = self._encode_prompt(prompt)
+        generated_ids = self._generate_ids(prompt_ids, prefix_length, do_sample)
+        generated_tokens = generated_ids[0].tolist()
+        flags = self._deep_flags(prompt_ids, generated_ids)
         tokens_generated = len(generated_tokens)
+        deep_tokens = sum(1 for flag in flags if flag)
         prefix_dtr = deep_tokens / tokens_generated if tokens_generated > 0 else 0.0
         generated_text = self.tokenizer.decode(generated_tokens)
         
@@ -465,45 +488,27 @@ class DTREngine:
         Returns:
             Tuple of (full_text, final_dtr, total_tokens)
         """
-        token_ids = self._encode_prompt(prompt)
-        prompt_len = token_ids.shape[1]
+        prompt_ids = self._encode_prompt(prompt)
         if prefix_ids:
-            prefix_tensor = torch.tensor([prefix_ids], dtype=token_ids.dtype, device=self.device)
-            token_ids = torch.cat([token_ids, prefix_tensor], dim=1)
+            prefix_tensor = torch.tensor([prefix_ids], dtype=prompt_ids.dtype, device=self.device)
+            context_ids = torch.cat([prompt_ids, prefix_tensor], dim=1)
         elif prefix_text:
             prefix_tensor = self.tokenizer.encode(
                 prefix_text, add_special_tokens=False, return_tensors="pt"
             ).to(self.device)
-            token_ids = torch.cat([token_ids, prefix_tensor], dim=1)
-        
-        # Count deep tokens in what we generate from here
-        deep_tokens = 0
-        tokens_generated = 0
-        generated_tokens = []
-        
-        for t in range(max_tokens):
-            next_token, is_deep = self.generate_step(
-                token_ids, do_sample=do_sample, prompt_len=prompt_len
-            )
-            if is_deep:
-                deep_tokens += 1
-            
-            generated_tokens.append(next_token.item())
-            tokens_generated += 1
-            token_ids = torch.cat([token_ids, next_token], dim=1)
-            
-            if next_token.item() in self.eos_token_ids:
-                break
-        
-        # Calculate final DTR over the continued portion
+            context_ids = torch.cat([prompt_ids, prefix_tensor], dim=1)
+        else:
+            context_ids = prompt_ids
+
+        continuation_ids = self._generate_ids(context_ids, max_tokens, do_sample)
+        generated_tokens = continuation_ids[0].tolist()
+        flags = self._deep_flags(context_ids, continuation_ids)
+        tokens_generated = len(generated_tokens)
+        deep_tokens = sum(1 for flag in flags if flag)
         continuation_dtr = deep_tokens / tokens_generated if tokens_generated > 0 else 0.0
-        
-        # Decode only the new tokens
         continuation_text = self.tokenizer.decode(generated_tokens)
         full_text = prefix_text + continuation_text
-        
-        # Total tokens = prefix + continuation
-        total_tokens = token_ids.shape[1] - prompt_len
+        total_tokens = context_ids.shape[1] + tokens_generated - prompt_ids.shape[1]
         
         return full_text, continuation_dtr, total_tokens
 
