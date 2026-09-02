@@ -24,6 +24,7 @@ class DTREngine:
         rho: float = 0.85, # Depth fraction (used in late regime start calculation)
         repetition_penalty: float | None = None,
         no_repeat_ngram_size: int | None = None,
+        local_files_only: bool = False,
     ):
         self.device = get_device()
         print(f"Device: {self.device}")
@@ -35,21 +36,35 @@ class DTREngine:
         self.model_id = model_id
         self.cache_dir = os.path.abspath(cache_dir)
         
-        # Load tokenizer and model
-        self.tokenizer = AutoTokenizer.from_pretrained(
-            model_id, 
+        def load_local_first(loader, **kwargs):
+            if local_files_only:
+                return loader.from_pretrained(
+                    model_id, local_files_only=True, **kwargs
+                )
+            try:
+                return loader.from_pretrained(
+                    model_id, local_files_only=True, **kwargs
+                )
+            except OSError:
+                print(f"{model_id} is not complete in {self.cache_dir}; downloading it")
+                return loader.from_pretrained(
+                    model_id, local_files_only=False, **kwargs
+                )
+
+        # Reuse a complete local snapshot without contacting the Hub. If it is
+        # absent or incomplete, download the missing files into the same cache.
+        self.tokenizer = load_local_first(
+            AutoTokenizer,
             cache_dir=self.cache_dir,
-            local_files_only=True   # Only use local files, no network calls
         )
         self.dtype = get_model_dtype(self.device)
         print(f"Load dtype: {self.dtype}")
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_id, 
+        self.model = load_local_first(
+            AutoModelForCausalLM,
             # bf16 on CUDA (native for Qwen3-4B); fp16 on MPS for memory.
             # JSD math is still upcast to float32 in generate_step.
             dtype=self.dtype,
             cache_dir=self.cache_dir,
-            local_files_only=True,   # Only use local files, no network calls
             low_cpu_mem_usage=True
         )
         self.model.to(self.device)

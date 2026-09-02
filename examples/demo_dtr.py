@@ -16,6 +16,7 @@ def main(
     repetition_penalty: float | None = None,
     no_repeat_ngram_size: int | None = None,
     seed: int | None = None,
+    local_files_only: bool = False,
 ):
     if model_name not in MODELS:
         raise ValueError(f"Unknown model '{model_name}'. Available: {list(MODELS.keys())}")
@@ -29,6 +30,7 @@ def main(
         **config,
         repetition_penalty=repetition_penalty,
         no_repeat_ngram_size=no_repeat_ngram_size,
+        local_files_only=local_files_only,
     )
     
     print(f"Using model: {model_name}")
@@ -66,7 +68,7 @@ if __name__ == "__main__":
         "--model", 
         default="qwen.6b", 
         choices=list(MODELS.keys()), 
-        help="Model to use (must be downloaded first)")
+        help="Model to use (downloaded automatically when absent from cache)")
     prompt = "Calculate 12 * 12: "
     # prompt = """ Circle 𝜔1 with radius 6 centered at point 𝐴 is internally tangent at point 𝐵 to circle 𝜔2 with radius 15. Points 𝐶 and 𝐷lie on 𝜔2 such that 𝐵𝐶 is a diameter of 𝜔2 and 𝐵𝐶 ⊥ 𝐴𝐷. The rectangle 𝐸𝐹𝐺 𝐻 is inscribed in 𝜔1 such that 𝐸𝐹 ⊥ 𝐵𝐶, 𝐶 is closer to 𝐺 𝐻 than to 𝐸𝐹, and 𝐷 is closer to 𝐹𝐺 than to 𝐸𝐻, as shown. Triangles △𝐷𝐺𝐹 and △𝐶 𝐻𝐺 have equal areas. The area of rectangle 𝐸𝐹𝐺 𝐻 is 𝑚 𝑛 , where 𝑚 and 𝑛 are relatively prime positive integers. Find 𝑚 + 𝑛."""
 
@@ -90,6 +92,11 @@ if __name__ == "__main__":
         help="Ban repeating n-grams (default 0 = off; >0 can break arithmetic)",
     )
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument(
+        "--local-files-only",
+        action="store_true",
+        help="Disable Hugging Face downloads and require an existing local cache",
+    )
     args = parser.parse_args()
     
     main(
@@ -100,4 +107,5 @@ if __name__ == "__main__":
         repetition_penalty=args.repetition_penalty,
         no_repeat_ngram_size=args.no_repeat_ngram_size,
         seed=args.seed,
+        local_files_only=args.local_files_only,
     )
