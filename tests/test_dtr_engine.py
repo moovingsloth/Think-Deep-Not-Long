@@ -2,7 +2,7 @@ import torch
 import unittest
 from unittest.mock import Mock, MagicMock, patch
 import torch.nn.functional as F
-from src.dtr_engine import DTREngine
+from src.dtr_engine import DTREngine, _move_model_to_device
 from src.model.model_utils import get_model_dtype
 
 
@@ -39,6 +39,42 @@ def assert_tensor_close(test_case, tensor1, tensor2, atol=1e-6, rtol=1e-5):
 # ============================================================================
 # Unit Tests (Mocked - Fast)
 # ============================================================================
+
+
+class TestModelTransfer(unittest.TestCase):
+    """Tests for the GB10 pinned-memory model transfer workaround."""
+
+    def test_regular_device_uses_standard_blocking_transfer(self):
+        model = Mock()
+
+        result = _move_model_to_device(model, torch.device("cpu"))
+
+        self.assertIs(result, model.to.return_value)
+        model.to.assert_called_once_with(torch.device("cpu"))
+
+    @patch("src.dtr_engine.torch.cuda.synchronize")
+    @patch("src.dtr_engine._is_gb10_cuda", return_value=True)
+    def test_gb10_pins_parameters_and_buffers_before_transfer(
+        self, _mock_is_gb10, mock_synchronize
+    ):
+        parameter = Mock()
+        parameter.data.pin_memory.return_value = "pinned parameter"
+        buffer = Mock()
+        buffer.data.pin_memory.return_value = "pinned buffer"
+        model = Mock()
+        model.parameters.return_value = [parameter]
+        model.buffers.return_value = [buffer]
+        model.to.return_value = model
+        device = torch.device("cuda")
+
+        result = _move_model_to_device(model, device)
+
+        self.assertIs(result, model)
+        self.assertEqual(parameter.data, "pinned parameter")
+        self.assertEqual(buffer.data, "pinned buffer")
+        model.to.assert_called_once_with(device, non_blocking=True)
+        mock_synchronize.assert_called_once_with(device)
+
 
 class TestDTREngineUnit(unittest.TestCase):
     """Unit tests with mocked model components (fast)."""

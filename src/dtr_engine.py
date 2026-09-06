@@ -1,6 +1,9 @@
 import math
-import torch
 import os
+import platform
+import time
+
+import torch
 import torch.nn.functional as F
 
 _LN2 = math.log(2.0)
@@ -14,6 +17,37 @@ from transformers import (
     TopPLogitsWarper,
 )
 from src.model.model_utils import get_device, get_model_dtype
+
+
+def _is_gb10_cuda(device: torch.device) -> bool:
+    """Return whether ``device`` is the GB10 CUDA device with slow pageable H2D."""
+    return (
+        device.type == "cuda"
+        and platform.machine() == "aarch64"
+        and torch.cuda.get_device_capability(device) == (12, 1)
+    )
+
+
+def _move_model_to_device(model, device: torch.device):
+    """Move a model to its device, pinning host tensors on GB10 first.
+
+    GB10's unified-memory pageable-copy path is pathologically slow when
+    ``Module.to`` transfers hundreds of model tensors one at a time. Pinning
+    the tensors and submitting non-blocking copies avoids that path.
+    """
+    if not _is_gb10_cuda(device):
+        return model.to(device)
+
+    print("Pinning model weights before CUDA transfer (GB10 workaround)...")
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.data = parameter.data.pin_memory()
+        for buffer in model.buffers():
+            buffer.data = buffer.data.pin_memory()
+    model.to(device, non_blocking=True)
+    torch.cuda.synchronize(device)
+    return model
+
 
 class DTREngine:
     def __init__(
@@ -44,15 +78,15 @@ class DTREngine:
         self.dtype = get_model_dtype(self.device)
         print(f"Load dtype: {self.dtype}")
         self.model = AutoModelForCausalLM.from_pretrained(
-            model_id, 
+            model_id,
             # bf16 on CUDA (native for Qwen3-4B); fp16 on MPS for memory.
             # JSD math is still upcast to float32 in generate_step.
             dtype=self.dtype,
             cache_dir=self.cache_dir,
-            local_files_only=True,   # Only use local files, no network calls
-            low_cpu_mem_usage=True
+            local_files_only=True,
+            low_cpu_mem_usage=True,
         )
-        self.model.to(self.device)
+        _move_model_to_device(self.model, self.device)
         # While RMSNorm and attention layers behave the same in train/eval mode, 
         # some models may have dropout or other layers that behave differently. 
         # Best practice is to call .eval() for inference.
@@ -75,6 +109,10 @@ class DTREngine:
             repetition_penalty=repetition_penalty,
             no_repeat_ngram_size=no_repeat_ngram_size,
         )
+        self.runtime_metrics = {
+            "prefix_tokens": 0, "prefix_seconds": 0.0,
+            "continuation_tokens": 0, "continuation_seconds": 0.0,
+        }
 
     def print_tokenizer_info(self):
         """Print key tokenizer configs."""
@@ -236,11 +274,12 @@ class DTREngine:
         input_ids: torch.Tensor,
         max_new_tokens: int,
         do_sample: bool,
+        attention_mask: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Decode with `model.generate()` so sampling matches the official path."""
         kwargs = {
             "input_ids": input_ids,
-            "attention_mask": torch.ones_like(input_ids),
+            "attention_mask": attention_mask if attention_mask is not None else torch.ones_like(input_ids),
             "max_new_tokens": max_new_tokens,
             "do_sample": do_sample,
             "use_cache": True,
@@ -262,21 +301,36 @@ class DTREngine:
         sequences = out.sequences if hasattr(out, "sequences") else out
         return sequences[:, input_ids.shape[1]:]
 
+    def _trim_eos(self, token_ids: list[int]) -> list[int]:
+        """Keep EOS itself but discard generation padding after the first EOS."""
+        for index, token_id in enumerate(token_ids):
+            if token_id in self.eos_token_ids:
+                return token_ids[: index + 1]
+        return token_ids
+
+    def _settling_layers_at(self, hidden_states, pos: int) -> torch.Tensor:
+        """Return an independent settling layer for every item in a batch."""
+        h_final = self.model.model.norm(hidden_states[-1][:, pos, :])
+        p_final = F.softmax(self.model.lm_head(h_final).float(), dim=-1)
+        settling = torch.full((p_final.shape[0],), self.L, device=p_final.device, dtype=torch.long)
+        unsettled = torch.ones_like(settling, dtype=torch.bool)
+        for layer in range(1, self.L + 1):
+            h_layer = self.model.model.norm(hidden_states[layer][:, pos, :])
+            p_layer = F.softmax(self.model.lm_head(h_layer).float(), dim=-1)
+            newly_settled = unsettled & (self.calculate_jsd(p_final, p_layer) <= self.g)
+            settling[newly_settled] = layer
+            unsettled &= ~newly_settled
+            if not bool(unsettled.any()):
+                break
+        return settling
+
     def _is_deep_at(self, hidden_states, pos: int) -> tuple[bool, int]:
         """Logit-lens settling test at a sequence position (Algorithm 1).
 
         Returns (is_deep, c_t) where c_t is the first layer whose JSD with the
         final layer is <= g.
         """
-        h_final = self.model.model.norm(hidden_states[-1][:, pos, :])
-        p_L = F.softmax(self.model.lm_head(h_final).to(torch.float32), dim=-1)
-        c_t = self.L
-        for l in range(1, self.L + 1):
-            h_l = self.model.model.norm(hidden_states[l][:, pos, :])
-            p_l = F.softmax(self.model.lm_head(h_l).to(torch.float32), dim=-1)
-            if self.calculate_jsd(p_L, p_l).item() <= self.g:
-                c_t = l
-                break
+        c_t = int(self._settling_layers_at(hidden_states, pos)[0].item())
         return c_t >= self.late_regime_start, c_t
 
     def _deep_flags(self, prompt_ids: torch.Tensor, generated_ids: torch.Tensor) -> list[tuple[bool, int]]:
@@ -294,6 +348,34 @@ class DTREngine:
             flags.append(self._is_deep_at(hidden_states, pos))
         return flags
 
+    def _deep_flags_batch(
+        self,
+        prompt_ids: torch.Tensor,
+        generated_ids: torch.Tensor,
+        lengths: list[int],
+        attention_mask: torch.Tensor | None = None,
+    ) -> list[list[tuple[bool, int]]]:
+        """Score a rectangular generated batch without mixing sample-level DTR."""
+        if not lengths or max(lengths, default=0) == 0:
+            return [[] for _ in lengths]
+        full = torch.cat([prompt_ids, generated_ids], dim=1)
+        with torch.no_grad():
+            full_mask = None
+            if attention_mask is not None:
+                full_mask = torch.cat([attention_mask, torch.ones_like(generated_ids)], dim=1)
+            hidden_states = self.model(
+                full, attention_mask=full_mask, output_hidden_states=True
+            ).hidden_states
+        prompt_len = prompt_ids.shape[1]
+        result = [[] for _ in lengths]
+        for offset in range(max(lengths)):
+            layers = self._settling_layers_at(hidden_states, prompt_len + offset - 1)
+            for sample_index, length in enumerate(lengths):
+                if offset < length:
+                    layer = int(layers[sample_index].item())
+                    result[sample_index].append((layer >= self.late_regime_start, layer))
+        return result
+
     def calculate_jsd(self, p, q):
         """Eq 2: Jensen-Shannon Divergence in bits, bounded in [0, 1].
 
@@ -305,7 +387,7 @@ class DTREngine:
         m = 0.5 * (p + q)
         log_m = m.clamp(min=1e-10).log()
         # Sum over vocab (last dim) so 1D and 2D [batch, vocab] both work.
-        kl = lambda dist: F.kl_div(log_m, dist, reduction="none", log_target=False).sum(dim=-1).mean()
+        kl = lambda dist: F.kl_div(log_m, dist, reduction="none", log_target=False).sum(dim=-1)
         return 0.5 * (kl(p) + kl(q)) / _LN2
 
     """
@@ -399,6 +481,61 @@ class DTREngine:
         generated_text = self.tokenizer.decode(generated_tokens)
         
         return generated_text, prefix_dtr, tokens_generated, generated_tokens
+
+    @staticmethod
+    def _rng_state():
+        cpu = torch.random.get_rng_state()
+        cuda = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+        return cpu, cuda
+
+    @staticmethod
+    def _restore_rng_state(state) -> None:
+        torch.random.set_rng_state(state[0])
+        if state[1] is not None:
+            torch.cuda.set_rng_state_all(state[1])
+
+    def _prefix_batch(self, prompt: str, count: int, prefix_length: int, do_sample: bool) -> list[dict]:
+        prompt_one = self._encode_prompt(prompt)
+        prompt_ids = prompt_one.repeat(count, 1)
+        started = time.monotonic()
+        generated = self._generate_ids(prompt_ids, prefix_length, do_sample)
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        self.runtime_metrics["prefix_seconds"] += time.monotonic() - started
+        ids = [self._trim_eos(row.tolist()) for row in generated]
+        self.runtime_metrics["prefix_tokens"] += sum(map(len, ids))
+        flags = self._deep_flags_batch(prompt_ids, generated, [len(row) for row in ids])
+        result = []
+        for token_ids, sample_flags in zip(ids, flags):
+            deep = sum(is_deep for is_deep, _ in sample_flags)
+            result.append({
+                "text": self.tokenizer.decode(token_ids),
+                "dtr": deep / len(token_ids) if token_ids else 0.0,
+                "prefix_dtr": deep / len(token_ids) if token_ids else 0.0,
+                "tokens": len(token_ids),
+                "generated_ids": token_ids,
+                "full_generation": False,
+            })
+        return result
+
+    def _run_adaptive_batches(self, items: list, requested_size: int, operation):
+        """Run batches, halving on CUDA OOM while replaying the same RNG stream."""
+        output, offset, batch_size = [], 0, max(1, requested_size)
+        while offset < len(items):
+            current = items[offset : offset + batch_size]
+            state = self._rng_state()
+            try:
+                output.extend(operation(current))
+                offset += len(current)
+            except torch.cuda.OutOfMemoryError:
+                self._restore_rng_state(state)
+                if batch_size == 1:
+                    raise
+                batch_size = max(1, batch_size // 2)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                print(f"CUDA OOM; retrying with batch size {batch_size}")
+        return output
     
     def generate_n_samples(
         self, 
@@ -409,6 +546,9 @@ class DTREngine:
         early_stop: bool = True,
         eta: float = 0.5,
         do_sample: bool = True,
+        prefix_batch_size: int = 1,
+        continuation_batch_size: int = 1,
+        score_continuation_dtr: bool = False,
     ) -> list[dict]:
         """
         Generate n samples with early stopping based on prefix DTR (for Think@n).
@@ -425,60 +565,89 @@ class DTREngine:
         Returns:
             List of sample dicts with keys: 'text', 'dtr', 'tokens', 'full_generation'
         """
-        samples = []
-        
         # Phase 1: Generate prefixes for all n samples
         print(f"Generating {n} prefixes ({prefix_length} tokens each)...")
-        for i in range(n):
-            prefix_text, prefix_dtr, tokens_gen, prefix_ids = self.estimate_dtr_from_prefix(
-                prompt, prefix_length, do_sample=do_sample
-            )
-            samples.append({
-                'text': prefix_text,
-                'dtr': prefix_dtr,
-                'prefix_dtr': prefix_dtr,
-                'tokens': tokens_gen,
-                'generated_ids': prefix_ids,
-                'full_generation': False,
-                'sample_id': i
-            })
+        slots = list(range(n))
+        samples = self._run_adaptive_batches(
+            slots, prefix_batch_size,
+            lambda batch: self._prefix_batch(prompt, len(batch), prefix_length, do_sample),
+        )
+        for sample_id, sample in enumerate(samples):
+            sample["sample_id"] = sample_id
         
         if not early_stop:
             # Continue all samples to completion
             print(f"Continuing all {n} samples to completion...")
-            for sample in samples:
-                full_text, final_dtr, total_tokens = self._continue_generation(
-                    prompt, sample['text'], max_tokens,
-                    prefix_ids=sample.get('generated_ids'),
-                    do_sample=do_sample,
-                )
-                sample['text'] = full_text
-                sample['continuation_dtr'] = final_dtr
-                sample['tokens'] = total_tokens
-                sample['full_generation'] = True
+            continued = self._run_adaptive_batches(
+                samples, continuation_batch_size,
+                lambda batch: self._continue_batch(
+                    prompt, batch, max_tokens, do_sample, score_continuation_dtr
+                ),
+            )
+            for sample, values in zip(samples, continued):
+                sample.update(values)
         else:
             # Phase 2: Rank by prefix DTR and continue only top eta%
             samples_sorted = sorted(samples, key=lambda x: x['dtr'], reverse=True)
             top_k = max(1, int(eta * n))
             
             print(f"Early stopping: continuing top {top_k}/{n} samples (η={eta})...")
-            for i, sample in enumerate(samples_sorted):
-                if i < top_k:
-                    # Continue top samples
-                    full_text, final_dtr, total_tokens = self._continue_generation(
-                        prompt, sample['text'], max_tokens,
-                        prefix_ids=sample.get('generated_ids'),
-                        do_sample=do_sample,
-                    )
-                    sample['text'] = full_text
-                    sample['continuation_dtr'] = final_dtr
-                    sample['tokens'] = total_tokens
-                    sample['full_generation'] = True
-                else:
-                    # Bottom samples stopped at prefix
-                    sample['full_generation'] = False
+            selected = samples_sorted[:top_k]
+            continued = self._run_adaptive_batches(
+                selected, continuation_batch_size,
+                lambda batch: self._continue_batch(
+                    prompt, batch, max_tokens, do_sample, score_continuation_dtr
+                ),
+            )
+            for sample, values in zip(selected, continued):
+                sample.update(values)
         
         return samples
+
+    def _continue_batch(
+        self,
+        prompt: str,
+        samples: list[dict],
+        max_tokens: int,
+        do_sample: bool,
+        score_dtr: bool = False,
+    ) -> list[dict]:
+        """Left-pad variable prefixes, generate once, and restore input order."""
+        prompt_ids = self._encode_prompt(prompt)[0]
+        contexts = [torch.cat([prompt_ids, torch.tensor(s["generated_ids"], device=self.device)]) for s in samples]
+        width = max(row.numel() for row in contexts)
+        pad_id = self.tokenizer.pad_token_id or self.tokenizer.eos_token_id
+        input_ids = torch.full((len(contexts), width), pad_id, dtype=prompt_ids.dtype, device=self.device)
+        attention_mask = torch.zeros_like(input_ids)
+        for index, row in enumerate(contexts):
+            input_ids[index, -row.numel():] = row
+            attention_mask[index, -row.numel():] = 1
+        started = time.monotonic()
+        generated = self._generate_ids(input_ids, max_tokens, do_sample, attention_mask)
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        rows = [self._trim_eos(row.tolist()) for row in generated]
+        self.runtime_metrics["continuation_seconds"] += time.monotonic() - started
+        self.runtime_metrics["continuation_tokens"] += sum(map(len, rows))
+        flags_by_sample = (
+            self._deep_flags_batch(
+                input_ids, generated, [len(row) for row in rows], attention_mask
+            )
+            if score_dtr
+            else [None] * len(rows)
+        )
+        output = []
+        for sample, token_ids, flags in zip(samples, rows, flags_by_sample):
+            values = {
+                "text": sample["text"] + self.tokenizer.decode(token_ids),
+                "tokens": len(sample["generated_ids"]) + len(token_ids),
+                "full_generation": True,
+            }
+            if flags is not None:
+                deep = sum(is_deep for is_deep, _ in flags)
+                values["continuation_dtr"] = deep / len(token_ids) if token_ids else 0.0
+            output.append(values)
+        return output
     
     def _continue_generation(
         self,

@@ -45,7 +45,10 @@ class ThinkAtN:
         n: int = 48,
         eta: float = 0.5,
         prefix_length: int = 50,
-        max_tokens: int = 500
+        max_tokens: int = 500,
+        prefix_batch_size: int = 1,
+        continuation_batch_size: int = 1,
+        score_continuation_dtr: bool = False,
     ):
         """
         Initialize Think@n with a DTREngine.
@@ -62,6 +65,9 @@ class ThinkAtN:
         self.eta = eta
         self.prefix_length = prefix_length
         self.max_tokens = max_tokens
+        self.prefix_batch_size = prefix_batch_size
+        self.continuation_batch_size = continuation_batch_size
+        self.score_continuation_dtr = score_continuation_dtr
     
     def solve(
         self,
@@ -106,7 +112,10 @@ class ThinkAtN:
             prefix_length=self.prefix_length,
             max_tokens=self.max_tokens,
             early_stop=early_stop,
-            eta=eta
+            eta=eta,
+            prefix_batch_size=self.prefix_batch_size,
+            continuation_batch_size=self.continuation_batch_size,
+            score_continuation_dtr=self.score_continuation_dtr,
         )
         
         # Calculate answers using different aggregation methods
@@ -116,10 +125,9 @@ class ThinkAtN:
         long_answer = long_at_n(samples, eta=eta)
         
         # Calculate costs
-        if early_stop:
-            think_cost = calculate_cost_with_prefix(samples, self.prefix_length, eta)
-        else:
-            think_cost = calculate_cost(samples)
+        # This is the algorithm's counterfactual inference cost even when all
+        # continuations were generated to retain a valid Cons@n baseline.
+        think_cost = calculate_cost_with_prefix(samples, self.prefix_length, eta)
         
         cons_cost = calculate_cost(samples)
         
