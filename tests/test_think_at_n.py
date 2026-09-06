@@ -78,6 +78,11 @@ class TestAnswerExtraction(unittest.TestCase):
         """If </think> never appears, use the full trace."""
         text = "<think>Therefore \\boxed{42}"
         self.assertEqual(extract_answer(text), "42")
+
+    def test_extract_multiple_choice_answer(self):
+        """Test GPQA-style option-letter extraction."""
+        self.assertEqual(extract_answer("Final answer: C"), "C")
+        self.assertEqual(extract_answer("B"), "B")
     
     def test_normalize_answer(self):
         """Test answer normalization."""

@@ -27,6 +27,14 @@ def _extract_answer_from_span(text: str) -> Optional[str]:
         if match:
             return match.group(1).strip()
 
+    # Multiple-choice benchmarks such as GPQA request a single option letter.
+    choice = re.search(r'(?:final\s+)?answer(?:\s+is|\s*:)?\s*\(?([A-D])\)?', text, re.IGNORECASE)
+    if choice:
+        return choice.group(1).upper()
+    stripped = text.strip().rstrip(".")
+    if re.fullmatch(r"\(?[A-Da-d]\)?", stripped):
+        return stripped.strip("()").upper()
+
     numbers = re.findall(r'[+-]?\d+\.?\d*', text)
     if numbers:
         return numbers[-1]

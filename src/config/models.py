@@ -1,13 +1,17 @@
 import os
 
 
-HF_HUB_CACHE = os.path.expanduser(
-    os.environ.get(
-        "HF_HUB_CACHE",
+_REPO_ROOT = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "..", "..")
+)
+_DEFAULT_HF_HUB_CACHE = os.path.join(_REPO_ROOT, ".cache", "huggingface", "hub")
+
+HF_HUB_CACHE = os.path.abspath(
+    os.path.expanduser(
         os.environ.get(
-            "HUGGINGFACE_HUB_CACHE",
-            "~/mnt/seraph-datasets/hub",
-        ),
+            "HF_HUB_CACHE",
+            os.environ.get("HUGGINGFACE_HUB_CACHE", _DEFAULT_HF_HUB_CACHE),
+        )
     )
 )
 

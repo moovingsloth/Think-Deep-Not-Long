@@ -1,58 +1,92 @@
+import argparse
 import os
 import sys
-import argparse
-from transformers import AutoModelForCausalLM, AutoTokenizer
-import torch
 
 from dotenv import load_dotenv
 
-# Add project root to path
+# Add the Think-Deep-Not-Long root to path
 _project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, _project_root)
 
 from src.config.models import MODELS
-from src.model.model_utils import get_model_dtype
 
-load_dotenv()  # Load .env from project root
+load_dotenv()
 HF_TOKEN = os.getenv("HF_TOKEN")
 
-def main():
+
+def _resolve_cache_dir(cache_dir: str) -> str:
+    if os.path.isabs(cache_dir):
+        return cache_dir
+    return os.path.join(_project_root, cache_dir)
+
+
+def _selected_names(args: argparse.Namespace) -> list[str]:
+    if args.all:
+        return list(MODELS.keys())
+    names: list[str] = []
+    names.extend(args.models)
+    if args.model_flags:
+        names.extend(args.model_flags)
+    if not names:
+        names = ["qwen4b", "qwen35"]
+    ordered: list[str] = []
+    seen: set[str] = set()
+    for name in names:
+        if name not in seen:
+            seen.add(name)
+            ordered.append(name)
+    return ordered
+
+
+def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Download model and tokenizer from Hugging Face"
+        description="Download Hugging Face model snapshots into the local cache"
+    )
+    parser.add_argument(
+        "models",
+        nargs="*",
+        metavar="MODEL",
+        choices=list(MODELS.keys()),
+        help="Short names from src.config.models (default: qwen4b qwen35)",
     )
     parser.add_argument(
         "--model",
-        default="qwen35",
+        action="append",
+        dest="model_flags",
+        metavar="MODEL",
         choices=list(MODELS.keys()),
-        help="Model to download (short name from config)"
+        help="Short name (repeatable; kept for compatibility)",
+    )
+    parser.add_argument("--all", action="store_true", help="Download every registered model")
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Print model ids and cache paths without downloading",
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="Redownload files even if they already exist in the cache",
     )
     args = parser.parse_args()
 
-    model_config = MODELS[args.model]
-    model_id = model_config["model_id"]
-    # Resolve cache_dir to absolute path (config uses relative paths)
-    project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-    cache_dir = os.path.join(project_root, model_config["cache_dir"])
+    for name in _selected_names(args):
+        config = MODELS[name]
+        model_id = config["model_id"]
+        cache_dir = _resolve_cache_dir(config["cache_dir"])
+        print(f"model={name} repo={model_id} cache_dir={cache_dir}")
+        if args.dry_run:
+            continue
+        os.makedirs(cache_dir, exist_ok=True)
+        from huggingface_hub import snapshot_download
 
-    print(f"🚀 Initializing download for {args.model} to: {cache_dir}")
-
-    os.makedirs(cache_dir, exist_ok=True)
-
-    tokenizer = AutoTokenizer.from_pretrained(
-        model_id,
-        cache_dir=cache_dir,
-        token=HF_TOKEN
-    )
-
-    model = AutoModelForCausalLM.from_pretrained(
-        model_id,
-        dtype=get_model_dtype(torch.device("cuda" if torch.cuda.is_available() else "cpu")),
-        cache_dir=cache_dir,
-        low_cpu_mem_usage=True,
-        token=HF_TOKEN
-    )
-
-    print(f"✅ Model and Tokenizer successfully stored in {cache_dir}")
+        snapshot_download(
+            repo_id=model_id,
+            cache_dir=cache_dir,
+            token=HF_TOKEN,
+            force_download=args.force,
+        )
+        print(f"stored {name} in {cache_dir}")
 
 
 if __name__ == "__main__":

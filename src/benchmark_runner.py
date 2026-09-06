@@ -16,11 +16,13 @@ import json
 import os
 import sys
 from datetime import datetime, timezone
+from pathlib import Path
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _ROOT)
 
 from src.config.models import MODELS
+from src.benchmark_datasets import BENCHMARKS, DEFAULT_DATASET_ROOT, load_benchmarks
 from src.dtr_engine import DTREngine
 from src.think_at_n import ThinkAtN
 
@@ -68,6 +70,12 @@ def parse_args() -> argparse.Namespace:
         default=3,
         help=f"How many of the {len(TEST_PROBLEMS)} built-in problems to run",
     )
+    parser.add_argument("--benchmarks", nargs="+", choices=BENCHMARKS)
+    parser.add_argument(
+        "--problems-per-dataset", type=int, default=0,
+        help="Cases per benchmark (0 loads the complete dataset)",
+    )
+    parser.add_argument("--dataset-root", default=str(DEFAULT_DATASET_ROOT))
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--early-stop",
@@ -96,7 +104,7 @@ def main() -> None:
     args = parse_args()
     if args.model not in MODELS:
         raise ValueError(f"Unknown model '{args.model}'. Available: {list(MODELS.keys())}")
-    if not 1 <= args.num_problems <= len(TEST_PROBLEMS):
+    if not args.benchmarks and not 1 <= args.num_problems <= len(TEST_PROBLEMS):
         raise ValueError(f"--num-problems must be 1..{len(TEST_PROBLEMS)}")
 
     import torch
@@ -114,7 +122,19 @@ def main() -> None:
     print("  thinking: enabled (chat template + enable_thinking=True)")
     print(f"  n={args.n}  eta={args.eta}  prefix={args.prefix_length}  max_tokens={args.max_tokens}")
     print(f"  early_stop={args.early_stop}  seed={args.seed}")
-    print(f"  problems: {args.num_problems}/{len(TEST_PROBLEMS)}")
+    if args.benchmarks:
+        problems, provenance = load_benchmarks(
+            args.benchmarks, args.problems_per_dataset, Path(args.dataset_root), args.seed
+        )
+        print(f"  benchmarks: {', '.join(args.benchmarks)}")
+        limit_label = "all" if args.problems_per_dataset == 0 else str(args.problems_per_dataset)
+        print(f"  problems: {len(problems)} ({limit_label} per dataset)")
+        for item in provenance:
+            print(f"  loaded {item['loaded']}/{item['available']} {item['benchmark']} from {item['source']}")
+    else:
+        problems = TEST_PROBLEMS[: args.num_problems]
+        provenance = [{"benchmark": "builtin", "loaded": len(problems), "available": len(TEST_PROBLEMS)}]
+        print(f"  problems: {args.num_problems}/{len(TEST_PROBLEMS)}")
     print()
 
     engine = DTREngine(**MODELS[args.model])
@@ -126,19 +146,19 @@ def main() -> None:
         max_tokens=args.max_tokens,
     )
 
-    problems = TEST_PROBLEMS[: args.num_problems]
     results = []
     for i, case in enumerate(problems, start=1):
         print(f"\n{'#' * 80}")
         print(f"Problem {i}/{len(problems)}")
         print(f"{'#' * 80}")
-        results.append(
-            think.solve(
+        result = think.solve(
                 problem=case["problem"],
                 ground_truth=case["answer"],
                 early_stop=args.early_stop,
             )
-        )
+        result["benchmark"] = case.get("benchmark", "builtin")
+        result["problem_id"] = case.get("id", str(i))
+        results.append(result)
 
     methods = ["think_at_n", "cons_at_n", "short_at_n", "long_at_n"]
     summary = {method: {"correct": 0, "total_cost": 0} for method in methods}
@@ -147,6 +167,18 @@ def main() -> None:
             if result[method]["correct"]:
                 summary[method]["correct"] += 1
             summary[method]["total_cost"] += result[method]["cost"]
+
+    benchmark_summary = {}
+    for benchmark in dict.fromkeys(result["benchmark"] for result in results):
+        benchmark_results = [r for r in results if r["benchmark"] == benchmark]
+        benchmark_summary[benchmark] = {
+            method: {
+                "correct": sum(bool(r[method]["correct"]) for r in benchmark_results),
+                "total": len(benchmark_results),
+                "accuracy": sum(bool(r[method]["correct"]) for r in benchmark_results) / len(benchmark_results),
+            }
+            for method in methods
+        }
 
     print("\n" + "=" * 80)
     print("SUMMARY")
@@ -189,8 +221,13 @@ def main() -> None:
             "early_stop": args.early_stop,
             "seed": args.seed,
             "num_problems": args.num_problems,
+            "benchmarks": args.benchmarks or ["builtin"],
+            "problems_per_dataset": args.problems_per_dataset if args.benchmarks else None,
+            "dataset_root": args.dataset_root if args.benchmarks else None,
         },
+        "dataset_provenance": provenance,
         "summary": summary,
+        "benchmark_summary": benchmark_summary,
         "results": [_jsonable(r) for r in results],
     }
     with open(output, "w", encoding="utf-8") as f:
