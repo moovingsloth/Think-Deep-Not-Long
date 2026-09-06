@@ -27,7 +27,10 @@ def _aime24(root: Path) -> tuple[list[dict], Path]:
         matches = re.findall(r"\\boxed\{([^{}]+)\}", row["solution"])
         if not matches:
             raise ValueError(f"AIME24 row {row['id']} has no boxed answer")
-        cases.append({"id": str(row["id"]), "problem": row["problem"], "answer": matches[-1]})
+        cases.append({
+            "id": str(row["id"]), "problem": row["problem"],
+            "answer": matches[-1], "answer_type": "math",
+        })
     return cases, path
 
 
@@ -37,6 +40,7 @@ def _math_jsonl(path: Path) -> tuple[list[dict], Path]:
             "id": str(row["id"]),
             "problem": row.get("problem", row.get("question")),
             "answer": str(row["answer"]),
+            "answer_type": "math",
         }
         for row in _read_jsonl(path)
     ], path
@@ -57,6 +61,7 @@ def _gpqa(root: Path, seed: int) -> tuple[list[dict], Path]:
                 "id": row["Record ID"] or str(index),
                 "problem": f"{row['Question']}\n\n{options}\n\nAnswer with only A, B, C, or D.",
                 "answer": answer,
+                "answer_type": "choice",
             })
     return cases, path
 

@@ -10,10 +10,14 @@ Implements various sample aggregation strategies from the paper:
 
 from typing import List, Optional, Callable
 from collections import Counter
-from src.answer_extraction import extract_answer, normalize_answer
+from src.answer_extraction import answers_match, extract_answer, normalize_answer
 
 
-def majority_vote(answers: List[Optional[str]]) -> Optional[str]:
+def majority_vote(
+    answers: List[Optional[str]],
+    *,
+    answer_type: str = "plain",
+) -> Optional[str]:
     """
     Perform majority voting over a list of answers.
     
@@ -30,20 +34,39 @@ def majority_vote(answers: List[Optional[str]]) -> Optional[str]:
         '12'  # Returns first in case of tie
     """
     # Filter out None values and normalize
-    valid_answers = [normalize_answer(ans) for ans in answers if ans is not None]
+    valid_answers = [ans for ans in answers if ans is not None]
     
     if not valid_answers:
         return None
     
-    # Count occurrences
-    counter = Counter(valid_answers)
-    
-    # Return most common (first in case of tie)
-    most_common = counter.most_common(1)
-    return most_common[0][0] if most_common else None
+    if answer_type == "plain":
+        counter = Counter(normalize_answer(ans) for ans in valid_answers)
+        most_common = counter.most_common(1)
+        return most_common[0][0] if most_common else None
+
+    groups: list[dict] = []
+    for answer in valid_answers:
+        for group in groups:
+            if answers_match(answer, group["answer"], answer_type=answer_type):
+                group["count"] += 1
+                break
+        else:
+            groups.append({"answer": answer, "count": 1})
+    return max(groups, key=lambda group: group["count"])["answer"]
 
 
-def cons_at_n(samples: List[dict], extract_fn: Callable = extract_answer) -> Optional[str]:
+def _extractor(answer_type: str, require_think_end: bool):
+    return lambda text: extract_answer(
+        text,
+        answer_type=answer_type,
+        require_think_end=require_think_end,
+    )
+
+
+def cons_at_n(
+    samples: List[dict], extract_fn: Callable | None = None, *,
+    answer_type: str = "plain", require_think_end: bool = False,
+) -> Optional[str]:
     """
     Consensus@n (Self-Consistency): Majority vote over all n samples.
     
@@ -56,11 +79,15 @@ def cons_at_n(samples: List[dict], extract_fn: Callable = extract_answer) -> Opt
     Returns:
         Final answer via majority vote
     """
+    extract_fn = extract_fn or _extractor(answer_type, require_think_end)
     answers = [extract_fn(sample['text']) for sample in samples]
-    return majority_vote(answers)
+    return majority_vote(answers, answer_type=answer_type)
 
 
-def short_at_n(samples: List[dict], eta: float = 0.5, extract_fn: Callable = extract_answer) -> Optional[str]:
+def short_at_n(
+    samples: List[dict], eta: float = 0.5, extract_fn: Callable | None = None, *,
+    answer_type: str = "plain", require_think_end: bool = False,
+) -> Optional[str]:
     """
     Short@n: Majority vote over shortest η% of samples.
     
@@ -84,11 +111,15 @@ def short_at_n(samples: List[dict], eta: float = 0.5, extract_fn: Callable = ext
     k = max(1, int(eta * len(samples)))
     selected = sorted_samples[:k]
     
+    extract_fn = extract_fn or _extractor(answer_type, require_think_end)
     answers = [extract_fn(sample['text']) for sample in selected]
-    return majority_vote(answers)
+    return majority_vote(answers, answer_type=answer_type)
 
 
-def long_at_n(samples: List[dict], eta: float = 0.5, extract_fn: Callable = extract_answer) -> Optional[str]:
+def long_at_n(
+    samples: List[dict], eta: float = 0.5, extract_fn: Callable | None = None, *,
+    answer_type: str = "plain", require_think_end: bool = False,
+) -> Optional[str]:
     """
     Long@n: Majority vote over longest η% of samples.
     
@@ -112,11 +143,15 @@ def long_at_n(samples: List[dict], eta: float = 0.5, extract_fn: Callable = extr
     k = max(1, int(eta * len(samples)))
     selected = sorted_samples[:k]
     
+    extract_fn = extract_fn or _extractor(answer_type, require_think_end)
     answers = [extract_fn(sample['text']) for sample in selected]
-    return majority_vote(answers)
+    return majority_vote(answers, answer_type=answer_type)
 
 
-def think_at_n(samples: List[dict], eta: float = 0.5, extract_fn: Callable = extract_answer) -> Optional[str]:
+def think_at_n(
+    samples: List[dict], eta: float = 0.5, extract_fn: Callable | None = None, *,
+    answer_type: str = "plain", require_think_end: bool = False,
+) -> Optional[str]:
     """
     Think@n: Majority vote over highest DTR η% of samples.
     
@@ -140,11 +175,15 @@ def think_at_n(samples: List[dict], eta: float = 0.5, extract_fn: Callable = ext
     k = max(1, int(eta * len(samples)))
     selected = sorted_samples[:k]
     
+    extract_fn = extract_fn or _extractor(answer_type, require_think_end)
     answers = [extract_fn(sample['text']) for sample in selected]
-    return majority_vote(answers)
+    return majority_vote(answers, answer_type=answer_type)
 
 
-def mean_at_n(samples: List[dict], ground_truth: str, extract_fn: Callable = extract_answer) -> float:
+def mean_at_n(
+    samples: List[dict], ground_truth: str, extract_fn: Callable | None = None, *,
+    answer_type: str = "plain", require_think_end: bool = False,
+) -> float:
     """
     Mean@n: Average accuracy across all samples (no aggregation).
     
@@ -162,11 +201,10 @@ def mean_at_n(samples: List[dict], ground_truth: str, extract_fn: Callable = ext
         return 0.0
     
     correct = 0
-    normalized_gt = normalize_answer(ground_truth)
-    
+    extract_fn = extract_fn or _extractor(answer_type, require_think_end)
     for sample in samples:
         answer = extract_fn(sample['text'])
-        if normalize_answer(answer) == normalized_gt:
+        if answers_match(answer, ground_truth, answer_type=answer_type):
             correct += 1
     
     return correct / len(samples)
@@ -210,7 +248,7 @@ def calculate_cost_with_prefix(
     n = len(samples)
     
     # Prefix cost: all samples generate prefix_length tokens
-    prefix_cost = prefix_length * n
+    prefix_cost = sum(sample.get('prefix_tokens', prefix_length) for sample in samples)
     
     # Continuation cost: only top eta% samples continue
     # Sort by DTR to identify top samples
@@ -220,7 +258,7 @@ def calculate_cost_with_prefix(
     
     # Sum tokens from full generations (excluding prefix which is counted separately)
     continuation_cost = sum(
-        max(0, sample.get('tokens', 0) - prefix_length) 
+        sample.get('continuation_tokens', max(0, sample.get('tokens', 0) - prefix_length))
         for sample in top_samples 
         if sample.get('full_generation', False)
     )

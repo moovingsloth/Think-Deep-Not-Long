@@ -28,15 +28,28 @@ from src.dtr_engine import DTREngine
 from src.compute_profiles import PROFILES, resolve_compute_profile
 from src.distributed_benchmark import load_json, selected_problem_keys, stable_problem_seed, summarize
 from src.think_at_n import ThinkAtN
-from src.answer_extraction import answers_match, extract_answer
 
 TEST_PROBLEMS = [
-    {"problem": "Calculate 12 * 12: ", "answer": "144"},
-    {"problem": "What is the square root of 144? ", "answer": "12"},
-    {"problem": "If x + 5 = 13, what is x? ", "answer": "8"},
-    {"problem": "Calculate 15 + 27: ", "answer": "42"},
-    {"problem": "What is 100 divided by 4? ", "answer": "25"},
+    {"problem": "Calculate 12 * 12: ", "answer": "144", "answer_type": "math"},
+    {"problem": "What is the square root of 144? ", "answer": "12", "answer_type": "math"},
+    {"problem": "If x + 5 = 13, what is x? ", "answer": "8", "answer_type": "math"},
+    {"problem": "Calculate 15 + 27: ", "answer": "42", "answer_type": "math"},
+    {"problem": "What is 100 divided by 4? ", "answer": "25", "answer_type": "math"},
 ]
+
+
+def _scored_prompt(case: dict) -> str:
+    if case.get("answer_type") == "choice":
+        instruction = (
+            'Reason step by step. After the reasoning, output exactly '
+            '{"answer":"X"}, where X is A, B, C, or D.'
+        )
+    else:
+        instruction = (
+            r"Reason step by step. After the reasoning, put only the final answer "
+            r"inside \boxed{}."
+        )
+    return f"{case['problem'].rstrip()}\n\n{instruction}"
 
 
 def parse_args() -> argparse.Namespace:
@@ -66,7 +79,7 @@ def parse_args() -> argparse.Namespace:
         "--max-tokens",
         type=int,
         default=512,
-        help="Max new tokens for each continued sample (thinking traces need room)",
+        help="Maximum total generated tokens per sample, including the DTR prefix",
     )
     parser.add_argument(
         "--num-problems",
@@ -101,6 +114,11 @@ def parse_args() -> argparse.Namespace:
         help="Continue only top-η samples (default: on). --no-early-stop generates all n fully.",
     )
     parser.add_argument(
+        "--require-complete",
+        action="store_true",
+        help="Fail with a partial JSON result if any fully-decoded sample hits the token limit",
+    )
+    parser.add_argument(
         "--output",
         default=None,
         help="JSON path for results (default: results/benchmark_<model>_<stamp>.json)",
@@ -128,6 +146,10 @@ def main() -> None:
         raise ValueError("--continuation-batch-size must be positive")
     if bool(args.shard_manifest) != bool(args.worker_id):
         raise ValueError("--shard-manifest and --worker-id must be supplied together")
+    if args.require_complete and args.early_stop:
+        raise ValueError("--require-complete requires --no-early-stop")
+    if args.max_tokens < 1:
+        raise ValueError("--max-tokens must be positive")
     if args.model not in MODELS:
         raise ValueError(f"Unknown model '{args.model}'. Available: {list(MODELS.keys())}")
     if not args.benchmarks and not 1 <= args.num_problems <= len(TEST_PROBLEMS):
@@ -176,6 +198,10 @@ def main() -> None:
         score_continuation_dtr=args.score_continuation_dtr,
     )
 
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    output = Path(args.output or os.path.join(
+        _ROOT, "results", f"benchmark_{args.model}_n{args.n}_{stamp}.json"
+    ))
     results = []
     benchmark_started = time.monotonic()
     for i, case in enumerate(problems, start=1):
@@ -186,15 +212,53 @@ def main() -> None:
         torch.manual_seed(problem_seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(problem_seed)
+        prompt = _scored_prompt(case)
         result = think.solve(
-                problem=case["problem"],
+                problem=prompt,
                 ground_truth=case["answer"],
                 early_stop=args.early_stop,
+                answer_type=case.get("answer_type", "math"),
+                require_think_end=True,
             )
+        result["problem"] = case["problem"]
+        result["prompt"] = prompt
         result["benchmark"] = case.get("benchmark", "builtin")
         result["problem_id"] = case.get("id", str(i))
         result["seed"] = problem_seed
         results.append(result)
+        if args.require_complete and any(
+            sample.get("finish_reason") == "length" for sample in result["samples"]
+        ):
+            print("Strict completion check failed; stopping before the next problem.")
+            break
+
+    samples = [sample for result in results for sample in result["samples"]]
+    completed_count = sum(bool(sample.get("completed")) for sample in samples)
+    parsed_count = sum(sample.get("extracted_answer") is not None for sample in samples)
+    truncated_count = sum(sample.get("finish_reason") == "length" for sample in samples)
+    finish_reason_counts = {
+        reason: sum(sample.get("finish_reason") == reason for sample in samples)
+        for reason in ("eos", "length", "dtr_early_stop")
+    }
+    invalid_reasons = []
+    if truncated_count:
+        invalid_reasons.append("token_limit_reached")
+    if len(results) != len(problems):
+        invalid_reasons.append("partial_problem_coverage")
+    validity = {
+        "valid": not invalid_reasons,
+        "require_complete": args.require_complete,
+        "expected_problem_count": len(problems),
+        "processed_problem_count": len(results),
+        "sample_count": len(samples),
+        "completed_count": completed_count,
+        "completion_rate": completed_count / len(samples) if samples else 0.0,
+        "truncated_count": truncated_count,
+        "parsed_answer_count": parsed_count,
+        "parse_rate": parsed_count / len(samples) if samples else 0.0,
+        "finish_reason_counts": finish_reason_counts,
+        "invalid_reasons": invalid_reasons,
+    }
 
     methods = ["think_at_n", "cons_at_n", "short_at_n", "long_at_n"]
     summary, benchmark_summary = summarize(results)
@@ -205,7 +269,7 @@ def main() -> None:
         for selected, sample in enumerate(ranked):
             row = {
                 "dtr": sample["dtr"],
-                "correct": answers_match(extract_answer(sample["text"]), result["ground_truth"]),
+                "correct": bool(sample.get("correct")),
             }
             (selected_rows if selected < selected_count else rejected_rows).append(row)
     def _mean(rows, key):
@@ -225,35 +289,33 @@ def main() -> None:
         ) if summary["cons_at_n"]["total_cost"] else 0.0,
     }
 
-    print("\n" + "=" * 80)
-    print("SUMMARY")
-    print("=" * 80)
-    print(f"{'Method':<25} {'Accuracy':<15} {'Total Cost':<15} {'Avg Cost'}")
-    print("-" * 80)
-    for method in methods:
-        accuracy = summary[method]["correct"] / len(results)
-        total_cost = summary[method]["total_cost"]
-        avg_cost = total_cost / len(results)
-        name = results[0][method]["method"]
-        print(f"{name:<25} {accuracy:>6.1%}{'':<8} {total_cost:>10,}{'':<5} {avg_cost:>8,.0f}")
+    if validity["valid"]:
+        print("\n" + "=" * 80)
+        print("SUMMARY")
+        print("=" * 80)
+        print(f"{'Method':<25} {'Accuracy':<15} {'Total Cost':<15} {'Avg Cost'}")
+        print("-" * 80)
+        for method in methods:
+            accuracy = summary[method]["correct"] / len(results)
+            total_cost = summary[method]["total_cost"]
+            avg_cost = total_cost / len(results)
+            name = results[0][method]["method"]
+            print(f"{name:<25} {accuracy:>6.1%}{'':<8} {total_cost:>10,}{'':<5} {avg_cost:>8,.0f}")
 
-    think_total = summary["think_at_n"]["total_cost"]
-    cons_total = summary["cons_at_n"]["total_cost"]
-    print("-" * 80)
-    if cons_total > 0:
-        savings = (1 - think_total / cons_total) * 100
-        print(f"Think@n cost savings vs Cons@n: {savings:.1f}%")
-    print(
-        f"Think@n accuracy: {summary['think_at_n']['correct'] / len(results):.1%}  "
-        f"Cons@n accuracy: {summary['cons_at_n']['correct'] / len(results):.1%}"
-    )
-    print("=" * 80)
-
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    output = args.output or os.path.join(
-        _ROOT, "results", f"benchmark_{args.model}_n{args.n}_{stamp}.json"
-    )
-    os.makedirs(os.path.dirname(output) or ".", exist_ok=True)
+        think_total = summary["think_at_n"]["total_cost"]
+        cons_total = summary["cons_at_n"]["total_cost"]
+        print("-" * 80)
+        if cons_total > 0:
+            savings = (1 - think_total / cons_total) * 100
+            print(f"Think@n cost savings vs Cons@n: {savings:.1f}%")
+        print(
+            f"Think@n accuracy: {summary['think_at_n']['correct'] / len(results):.1%}  "
+            f"Cons@n accuracy: {summary['cons_at_n']['correct'] / len(results):.1%}"
+        )
+        print("=" * 80)
+    else:
+        print("\nAccuracy summary suppressed because strict completion validation failed.")
+    output.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "config": {
             "model": args.model,
@@ -274,7 +336,9 @@ def main() -> None:
             "continuation_batch_size": continuation_batch_size,
             "worker_id": args.worker_id,
             "score_continuation_dtr": args.score_continuation_dtr,
+            "require_complete": args.require_complete,
         },
+        "validity": validity,
         "dataset_provenance": provenance,
         "summary": summary,
         "benchmark_summary": benchmark_summary,
@@ -288,9 +352,14 @@ def main() -> None:
             "problem_count": len(results),
         },
     }
-    with open(output, "w", encoding="utf-8") as f:
+    temporary_output = output.with_suffix(output.suffix + ".tmp")
+    with temporary_output.open("w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False, indent=2)
+    os.replace(temporary_output, output)
     print(f"Wrote {output}")
+    if args.require_complete and not validity["valid"]:
+        print(f"INVALID BENCHMARK: {', '.join(invalid_reasons)}")
+        raise SystemExit(2)
 
 
 if __name__ == "__main__":

@@ -308,6 +308,10 @@ class DTREngine:
                 return token_ids[: index + 1]
         return token_ids
 
+    def _finished_with_eos(self, token_ids: list[int]) -> bool:
+        """Return whether generation emitted a configured EOS token."""
+        return any(token_id in self.eos_token_ids for token_id in token_ids)
+
     def _settling_layers_at(self, hidden_states, pos: int) -> torch.Tensor:
         """Return an independent settling layer for every item in a batch."""
         h_final = self.model.model.norm(hidden_states[-1][:, pos, :])
@@ -513,8 +517,12 @@ class DTREngine:
                 "dtr": deep / len(token_ids) if token_ids else 0.0,
                 "prefix_dtr": deep / len(token_ids) if token_ids else 0.0,
                 "tokens": len(token_ids),
+                "prefix_tokens": len(token_ids),
+                "continuation_tokens": 0,
                 "generated_ids": token_ids,
-                "full_generation": False,
+                "completed": self._finished_with_eos(token_ids),
+                "finish_reason": "eos" if self._finished_with_eos(token_ids) else None,
+                "full_generation": self._finished_with_eos(token_ids),
             })
         return result
 
@@ -565,12 +573,15 @@ class DTREngine:
         Returns:
             List of sample dicts with keys: 'text', 'dtr', 'tokens', 'full_generation'
         """
+        if max_tokens < 1:
+            raise ValueError("max_tokens must be positive")
+        prefix_budget = min(prefix_length, max_tokens)
         # Phase 1: Generate prefixes for all n samples
-        print(f"Generating {n} prefixes ({prefix_length} tokens each)...")
+        print(f"Generating {n} prefixes ({prefix_budget} tokens each)...")
         slots = list(range(n))
         samples = self._run_adaptive_batches(
             slots, prefix_batch_size,
-            lambda batch: self._prefix_batch(prompt, len(batch), prefix_length, do_sample),
+            lambda batch: self._prefix_batch(prompt, len(batch), prefix_budget, do_sample),
         )
         for sample_id, sample in enumerate(samples):
             sample["sample_id"] = sample_id
@@ -578,13 +589,14 @@ class DTREngine:
         if not early_stop:
             # Continue all samples to completion
             print(f"Continuing all {n} samples to completion...")
+            pending = [sample for sample in samples if not sample["completed"]]
             continued = self._run_adaptive_batches(
-                samples, continuation_batch_size,
+                pending, continuation_batch_size,
                 lambda batch: self._continue_batch(
                     prompt, batch, max_tokens, do_sample, score_continuation_dtr
                 ),
             )
-            for sample, values in zip(samples, continued):
+            for sample, values in zip(pending, continued):
                 sample.update(values)
         else:
             # Phase 2: Rank by prefix DTR and continue only top eta%
@@ -593,13 +605,18 @@ class DTREngine:
             
             print(f"Early stopping: continuing top {top_k}/{n} samples (η={eta})...")
             selected = samples_sorted[:top_k]
+            for sample in samples_sorted[top_k:]:
+                if not sample["completed"]:
+                    sample["finish_reason"] = "dtr_early_stop"
             continued = self._run_adaptive_batches(
-                selected, continuation_batch_size,
+                [sample for sample in selected if not sample["completed"]], continuation_batch_size,
                 lambda batch: self._continue_batch(
                     prompt, batch, max_tokens, do_sample, score_continuation_dtr
                 ),
             )
-            for sample, values in zip(selected, continued):
+            for sample, values in zip(
+                [sample for sample in selected if not sample["completed"]], continued
+            ):
                 sample.update(values)
         
         return samples
@@ -623,7 +640,16 @@ class DTREngine:
             input_ids[index, -row.numel():] = row
             attention_mask[index, -row.numel():] = 1
         started = time.monotonic()
-        generated = self._generate_ids(input_ids, max_tokens, do_sample, attention_mask)
+        remaining_tokens = max_tokens - max(sample["prefix_tokens"] for sample in samples)
+        if remaining_tokens <= 0:
+            return [{
+                "tokens": sample["prefix_tokens"],
+                "continuation_tokens": 0,
+                "completed": False,
+                "finish_reason": "length",
+                "full_generation": True,
+            } for sample in samples]
+        generated = self._generate_ids(input_ids, remaining_tokens, do_sample, attention_mask)
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
         rows = [self._trim_eos(row.tolist()) for row in generated]
@@ -638,9 +664,13 @@ class DTREngine:
         )
         output = []
         for sample, token_ids, flags in zip(samples, rows, flags_by_sample):
+            completed = self._finished_with_eos(token_ids)
             values = {
                 "text": sample["text"] + self.tokenizer.decode(token_ids),
                 "tokens": len(sample["generated_ids"]) + len(token_ids),
+                "continuation_tokens": len(token_ids),
+                "completed": completed,
+                "finish_reason": "eos" if completed else "length",
                 "full_generation": True,
             }
             if flags is not None:

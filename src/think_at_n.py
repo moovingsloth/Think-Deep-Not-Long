@@ -75,7 +75,9 @@ class ThinkAtN:
         ground_truth: Optional[str] = None,
         n: Optional[int] = None,
         eta: Optional[float] = None,
-        early_stop: bool = True
+        early_stop: bool = True,
+        answer_type: str = "plain",
+        require_think_end: bool = False,
     ) -> Dict:
         """
         Solve a problem using Think@n and compare with baselines.
@@ -119,10 +121,27 @@ class ThinkAtN:
         )
         
         # Calculate answers using different aggregation methods
-        think_answer = think_at_n_vote(samples, eta=eta)
-        cons_answer = cons_at_n(samples)
-        short_answer = short_at_n(samples, eta=eta)
-        long_answer = long_at_n(samples, eta=eta)
+        scoring = {
+            "answer_type": answer_type,
+            "require_think_end": require_think_end,
+        }
+        think_answer = think_at_n_vote(samples, eta=eta, **scoring)
+        cons_answer = cons_at_n(samples, **scoring)
+        short_answer = short_at_n(samples, eta=eta, **scoring)
+        long_answer = long_at_n(samples, eta=eta, **scoring)
+
+        for sample in samples:
+            extracted = extract_answer(
+                sample["text"],
+                answer_type=answer_type,
+                require_think_end=require_think_end,
+            )
+            sample["extracted_answer"] = extracted
+            sample["answer_status"] = "parsed" if extracted is not None else "unparseable"
+            sample["correct"] = (
+                answers_match(extracted, ground_truth, answer_type=answer_type)
+                if ground_truth is not None else None
+            )
         
         # Calculate costs
         # This is the algorithm's counterfactual inference cost even when all
@@ -134,8 +153,8 @@ class ThinkAtN:
         # Short@n cost: prefix overhead + shortest samples
         sorted_by_length = sorted(samples, key=lambda x: x.get('tokens', 0))
         k_short = max(1, int(eta * n))
-        short_cost = (self.prefix_length * n) + sum(
-            max(0, s['tokens'] - self.prefix_length) 
+        short_cost = sum(s.get("prefix_tokens", self.prefix_length) for s in samples) + sum(
+            s.get("continuation_tokens", max(0, s['tokens'] - self.prefix_length))
             for s in sorted_by_length[:k_short]
         )
         
@@ -150,16 +169,17 @@ class ThinkAtN:
         mean_accuracy = None
         
         if ground_truth is not None:
-            think_correct = answers_match(think_answer, ground_truth)
-            cons_correct = answers_match(cons_answer, ground_truth)
-            short_correct = answers_match(short_answer, ground_truth)
-            long_correct = answers_match(long_answer, ground_truth)
-            mean_accuracy = mean_at_n(samples, ground_truth)
+            think_correct = answers_match(think_answer, ground_truth, answer_type=answer_type)
+            cons_correct = answers_match(cons_answer, ground_truth, answer_type=answer_type)
+            short_correct = answers_match(short_answer, ground_truth, answer_type=answer_type)
+            long_correct = answers_match(long_answer, ground_truth, answer_type=answer_type)
+            mean_accuracy = mean_at_n(samples, ground_truth, **scoring)
         
         # Build result dictionary
         result = {
             'problem': problem,
             'ground_truth': ground_truth,
+            'answer_type': answer_type,
             'samples': samples,
             'think_at_n': {
                 'answer': think_answer,
@@ -188,11 +208,17 @@ class ThinkAtN:
             'mean_at_n': {
                 'accuracy': mean_accuracy,
                 'method': 'Mean@n (No aggregation)'
-            }
+            },
+            'evaluation_valid': not any(
+                sample.get("finish_reason") == "length" for sample in samples
+            ),
         }
         
         # Print summary
-        self._print_results(result)
+        if result["evaluation_valid"]:
+            self._print_results(result)
+        else:
+            print("\nResults suppressed: at least one sample reached the token limit.\n")
         
         return result
     

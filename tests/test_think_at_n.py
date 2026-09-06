@@ -79,6 +79,28 @@ class TestAnswerExtraction(unittest.TestCase):
         text = "<think>Therefore \\boxed{42}"
         self.assertEqual(extract_answer(text), "42")
 
+    def test_strict_extraction_rejects_unfinished_thinking(self):
+        text = "<think>We saw 1, 2, and 3"
+        self.assertIsNone(
+            extract_answer(text, answer_type="math", require_think_end=True)
+        )
+
+    def test_extracts_nested_boxed_math_and_json_choice(self):
+        text = r"<think>work</think> Therefore $\boxed{\frac{1}{576}}$"
+        answer = extract_answer(text, answer_type="math", require_think_end=True)
+        self.assertEqual(answer, r"\frac{1}{576}")
+        self.assertTrue(
+            answers_match(answer, "1/576", answer_type="math")
+        )
+        self.assertEqual(
+            extract_answer(
+                '<think>work</think> {"answer":"C"}',
+                answer_type="choice",
+                require_think_end=True,
+            ),
+            "C",
+        )
+
     def test_extract_multiple_choice_answer(self):
         """Test GPQA-style option-letter extraction."""
         self.assertEqual(extract_answer("Final answer: C"), "C")
